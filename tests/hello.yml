@@ -1,0 +1,7 @@
+version: 1
+provider:
+  name: test
+  scripts:
+    - service: ""
+      script: print("Hello, World")
+services:
