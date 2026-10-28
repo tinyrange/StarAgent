@@ -4,4 +4,9 @@ provider:
   scripts:
     - service: ""
       script: print("Hello, World")
+    - service: hello
+      script: print(hello("World"))
 services:
+  hello:
+    kind: shell-repl
+    args: ["go", "run", "./cmd/sa-service", "-cwd", "."]

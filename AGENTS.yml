@@ -1,0 +1,6 @@
+version: 1
+
+environment:
+  hello: |
+    def hello(world):
+      return "Hello, " + world
