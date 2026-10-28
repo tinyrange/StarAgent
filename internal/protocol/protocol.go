@@ -129,6 +129,10 @@ func (s *Server) Exchange(ctx context.Context) (string, io.WriteCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return "", nil, err
 	}
+	// EOF between requests is a clean disconnect; EOF inside a frame is not.
+	if _, err := s.reader.Peek(1); err != nil {
+		return "", nil, fmt.Errorf("failed to read request: %w", err)
+	}
 
 	data, err := readFrame(s.reader, endOfMessageBytes)
 	if err != nil {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,58 +13,77 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: %s cmd [args]", os.Args[0])
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+func run() error {
+	if len(os.Args) < 2 {
+		return fmt.Errorf("usage: %s cmd [args]", os.Args[0])
 	}
 
 	cmd := exec.Command(os.Args[1], os.Args[2:]...)
+	cmd.Stderr = os.Stderr
 
 	outPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
+	defer outPipe.Close()
 	inPipe, err := cmd.StdinPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
+	defer inPipe.Close()
 
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
-	defer cmd.Process.Kill()
+	defer func() {
+		inPipe.Close()
+		if cmd.ProcessState == nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+	}()
 
 	client, err := protocol.StartClient(inPipe, outPipe)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	rl, err := readline.New(">>> ")
+	if err != nil {
+		return err
+	}
+	defer rl.Close()
 
 	for {
-		func() {
-			line, err := rl.Readline()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error reading line: %v\n", err)
-				os.Exit(1)
+		line, err := rl.Readline()
+		if errors.Is(err, io.EOF) || (errors.Is(err, readline.ErrInterrupt) && line == "") {
+			if err := inPipe.Close(); err != nil {
+				return err
 			}
+			return cmd.Wait()
+		}
+		if errors.Is(err, readline.ErrInterrupt) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("reading line: %w", err)
+		}
 
-			data, err := client.Exchange(context.Background(), line)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error exchanging: %v\n", err)
-				os.Exit(1)
-			}
-			defer data.Close()
-
-			if _, err := io.Copy(rl, data); err != nil {
-				fmt.Fprintf(os.Stderr, "error writing output: %v\n", err)
-				os.Exit(1)
-			}
-		}()
+		data, err := client.Exchange(context.Background(), line)
+		if err != nil {
+			return fmt.Errorf("exchanging: %w", err)
+		}
+		_, copyErr := io.Copy(rl, data)
+		closeErr := data.Close()
+		if err := errors.Join(copyErr, closeErr); err != nil {
+			return fmt.Errorf("reading response: %w", err)
+		}
 	}
 }

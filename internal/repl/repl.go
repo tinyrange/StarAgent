@@ -3,6 +3,7 @@ package repl
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,36 +38,57 @@ func Start(opts Options) error {
 	}
 
 	for {
-		err := func() error {
-			input, output, err := server.Exchange(context.Background())
-			if err != nil {
-				return fmt.Errorf("failed to exchange: %w", err)
-			}
-			defer output.Close()
-
-			parsed, err := opts.SyntaxOptions.Parse("<repl>", input, syntax.RetainComments)
-			if err != nil {
-				if _, err := fmt.Fprintf(output, "%v\n", err); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to write: %v", err)
-				}
-			}
-
-			opts.Thread.Print = func(thread *starlark.Thread, msg string) {
-				if _, err := fmt.Fprintf(output, "%s\n", msg); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to write: %v", err)
-				}
-			}
-
-			if err := starlark.ExecREPLChunk(parsed, opts.Thread, opts.Environment); err != nil {
-				if _, innerErr := fmt.Fprintf(output, "error: %v\n", err); err != nil {
-					return fmt.Errorf("failed to write error: %v (inner %w)", err, innerErr)
-				}
-			}
-
+		input, output, err := server.Exchange(context.Background())
+		if errors.Is(err, io.EOF) {
 			return nil
-		}()
+		}
 		if err != nil {
+			return fmt.Errorf("failed to exchange: %w", err)
+		}
+		evalErr := evaluate(opts, input, output)
+		if err := errors.Join(evalErr, output.Close()); err != nil {
 			return err
 		}
 	}
+}
+
+func evaluate(opts Options, input string, output io.Writer) error {
+	parsed, err := opts.SyntaxOptions.Parse("<repl>", input, syntax.RetainComments)
+	if err != nil {
+		_, writeErr := fmt.Fprintf(output, "%v\n", err)
+		return writeErr
+	}
+
+	var printErr error
+	opts.Thread.Print = func(thread *starlark.Thread, msg string) {
+		if printErr == nil {
+			_, printErr = fmt.Fprintln(output, msg)
+		}
+	}
+
+	// A lone expression should display its value, as in the Starlark REPL.
+	if len(parsed.Stmts) == 1 {
+		if expr, ok := parsed.Stmts[0].(*syntax.ExprStmt); ok {
+			var value starlark.Value
+			value, err = starlark.EvalExprOptions(parsed.Options, opts.Thread, expr.X, opts.Environment)
+			if err == nil {
+				opts.Environment["_"] = value
+				if value != starlark.None && printErr == nil {
+					_, printErr = fmt.Fprintln(output, value)
+				}
+			}
+		} else {
+			err = starlark.ExecREPLChunk(parsed, opts.Thread, opts.Environment)
+		}
+	} else {
+		err = starlark.ExecREPLChunk(parsed, opts.Thread, opts.Environment)
+	}
+	if printErr != nil {
+		return printErr
+	}
+	if err != nil {
+		_, writeErr := fmt.Fprintf(output, "error: %v\n", err)
+		return writeErr
+	}
+	return nil
 }
