@@ -185,6 +185,8 @@ type Client struct {
 	reading       bool
 }
 
+func (c *Client) Documentation() string { return string(c.documentation) }
+
 // Exchange writes one request and returns a streaming response reader. The
 // response reader must be closed before another Exchange; Close consumes any
 // remaining response text through ATTENTION so the next exchange is aligned.

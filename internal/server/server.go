@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -19,12 +20,19 @@ type Server struct {
 }
 
 func (s *Server) Close() error {
+	var err error
 	for _, session := range s.sessions {
-		if err := session.Close(); err != nil {
-			return err
-		}
+		err = errors.Join(err, session.Close())
 	}
 
+	return err
+}
+
+func (s *Server) RegisterServiceFactory(kind string, factory ServiceFactory) error {
+	if _, ok := s.serviceFactories[kind]; ok {
+		return fmt.Errorf("service factory %s already registered", kind)
+	}
+	s.serviceFactories[kind] = factory
 	return nil
 }
 

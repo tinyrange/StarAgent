@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 )
 
 type ProviderConfig struct {
@@ -43,8 +44,12 @@ type testProviderSession struct {
 // runScripts implements [serverTestProviderInterface].
 func (t *testProviderSession) runScripts(ctx context.Context, scripts []serverTestProviderScript, callbacks TurnCallbacks) error {
 	for _, script := range scripts {
-		if _, err := callbacks.OnToolCall(ctx, script.Service, script.Script); err != nil {
+		output, err := callbacks.OnToolCall(ctx, script.Service, script.Script)
+		if err != nil {
 			return fmt.Errorf("failed to execute: %w", err)
+		}
+		if _, err := io.WriteString(os.Stdout, output); err != nil {
+			return err
 		}
 	}
 

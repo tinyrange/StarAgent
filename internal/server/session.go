@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -13,10 +14,11 @@ func makeSessionId() string {
 }
 
 type Session struct {
-	server    *Server
-	sessionId string
-	provider  ProviderSession
-	services  map[string]Service
+	server         *Server
+	sessionId      string
+	provider       ProviderSession
+	services       map[string]Service
+	serviceConfigs map[string]map[string]any
 }
 
 // OnCommentaryFragment implements [TurnCallbacks].
@@ -28,7 +30,23 @@ func (s *Session) OnCommentaryFragment(fragment string) error {
 func (s *Session) OnToolCall(ctx context.Context, serviceName string, line string) (string, error) {
 	service, ok := s.services[serviceName]
 	if !ok {
-		return "", fmt.Errorf("failed to find service [%s] on session", serviceName)
+		config, ok := s.serviceConfigs[serviceName]
+		if !ok {
+			return "", fmt.Errorf("failed to find service [%s] on session", serviceName)
+		}
+		kind, _ := config["kind"].(string)
+		factory, ok := s.server.serviceFactories[kind]
+		if !ok {
+			return "", fmt.Errorf("service %q: unknown kind %q", serviceName, kind)
+		}
+		var err error
+		service, err = factory.Create(ctx, config)
+		if err != nil {
+			return "", fmt.Errorf("failed to create service %q: %w", serviceName, err)
+		}
+		if err := s.RegisterService(ctx, serviceName, service); err != nil {
+			return "", err
+		}
 	}
 
 	return service.ExecuteLine(ctx, line)
@@ -36,7 +54,12 @@ func (s *Session) OnToolCall(ctx context.Context, serviceName string, line strin
 
 // Close implements [io.Closer].
 func (s *Session) Close() error {
-	return s.provider.Close()
+	var err error
+	for name, service := range s.services {
+		err = errors.Join(err, service.Close())
+		delete(s.services, name)
+	}
+	return errors.Join(err, s.provider.Close())
 }
 
 func (s *Session) Id() string                { return s.sessionId }
@@ -47,11 +70,10 @@ func (s *Session) RegisterService(ctx context.Context, name string, service Serv
 		return fmt.Errorf("session has already regisrtered %s", name)
 	}
 
-	s.services[name] = service
-
-	if err := s.services[name].Init(ctx); err != nil {
-		return fmt.Errorf("failed to init service: %w", err)
+	if err := service.Init(ctx); err != nil {
+		return fmt.Errorf("failed to init service %q: %w", name, errors.Join(err, service.Close()))
 	}
+	s.services[name] = service
 
 	return nil
 }

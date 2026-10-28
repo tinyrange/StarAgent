@@ -17,6 +17,7 @@ type Options struct {
 	SyntaxOptions *syntax.FileOptions
 	Thread        *starlark.Thread
 	Environment   starlark.StringDict
+	Documentation string
 
 	Input  io.Reader
 	Output io.Writer
@@ -30,9 +31,7 @@ func Start(opts Options) error {
 		opts.Output = os.Stdout
 	}
 
-	var documentation = ""
-
-	server, err := protocol.StartServer(opts.Output, opts.Input, bytes.NewBufferString(documentation))
+	server, err := protocol.StartServer(opts.Output, opts.Input, bytes.NewBufferString(opts.Documentation))
 	if err != nil {
 		return fmt.Errorf("failed to start server: %w", err)
 	}

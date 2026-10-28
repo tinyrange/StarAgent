@@ -86,5 +86,6 @@ func Run() error {
 		SyntaxOptions: &starlarkOptions,
 		Thread:        &starlark.Thread{Name: "service repl"},
 		Environment:   env,
+		Documentation: "",
 	})
 }

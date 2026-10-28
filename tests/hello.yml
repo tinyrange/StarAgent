@@ -4,8 +4,11 @@ provider:
   scripts:
     - service: ""
       script: print("Hello, World")
+
     - service: hello
-      script: print(hello("World"))
+      script: test = "World"
+    - service: hello
+      script: print(hello(test))
 services:
   hello:
     kind: shell-repl

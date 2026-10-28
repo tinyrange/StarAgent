@@ -4,13 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 )
 
 type ServiceFactory interface {
-	Create(ctx context.Context) (Service, error)
+	Create(ctx context.Context, config map[string]any) (Service, error)
 }
 
 type Service interface {
@@ -33,7 +34,7 @@ func (s *serverService) Close() error {
 
 // Documentation implements [Service].
 func (s *serverService) Documentation(ctx context.Context) (string, error) {
-	return "", fmt.Errorf("Documentation not implemented on serverService")
+	return "", nil
 }
 
 // ExecuteLine implements [Service].
@@ -46,13 +47,16 @@ func (s *serverService) ExecuteLine(ctx context.Context, line string) (string, e
 	}
 
 	thread := s.getThread()
+	var output strings.Builder
+	thread.Print = func(_ *starlark.Thread, msg string) {
+		fmt.Fprintln(&output, msg)
+	}
 
 	if err := starlark.ExecREPLChunk(file, thread, s.declared); err != nil {
 		return "", fmt.Errorf("failed to execute: %w", err)
 	}
 
-	// TODO(joshua): Handle returning script results.
-	return "", nil
+	return output.String(), nil
 }
 
 func (s *serverService) getOptions() syntax.FileOptions {

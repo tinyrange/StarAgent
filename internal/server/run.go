@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -20,8 +21,7 @@ type serverTestProvider struct {
 	Scripts []serverTestProviderScript `yaml:"scripts"`
 }
 
-type serverTestService struct {
-}
+type serverTestService = map[string]any
 
 type serverTestFile struct {
 	Version  int                          `yaml:"version"`
@@ -43,8 +43,18 @@ func (s *serverTestFile) execute(server *Server) error {
 
 	session, err := server.CreateSession(s.Provider.Name, ProviderConfig{})
 	if err != nil {
-		return fmt.Errorf("failed to make sessiion: %w", err)
+		return fmt.Errorf("failed to make session: %w", err)
 	}
+	for name, config := range s.Services {
+		if name == "" {
+			return fmt.Errorf("service name is reserved for the inbuilt service")
+		}
+		kind, _ := config["kind"].(string)
+		if _, ok := server.serviceFactories[kind]; !ok {
+			return fmt.Errorf("service %q: unknown kind %q", name, kind)
+		}
+	}
+	session.serviceConfigs = s.Services
 
 	if test, ok := session.Provider().(serverTestProviderInterface); ok {
 		return test.runScripts(context.Background(), s.Provider.Scripts, session)
@@ -53,7 +63,7 @@ func (s *serverTestFile) execute(server *Server) error {
 	}
 }
 
-func Run() error {
+func Run() (err error) {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	testName := fs.String("run-test", "", "run a specified test YAML file")
@@ -67,7 +77,10 @@ func Run() error {
 		sessions:         make(map[string]*Session),
 		serviceFactories: make(map[string]ServiceFactory),
 	}
-	defer server.Close()
+	defer func() { err = errors.Join(err, server.Close()) }()
+	if err := server.RegisterServiceFactory("shell-repl", &shellREPLFactory{}); err != nil {
+		return err
+	}
 
 	if *testName != "" {
 		// add test provider
