@@ -103,7 +103,12 @@ func Run() error {
 		return fmt.Errorf("failed to parse args: %w", err)
 	}
 
-	root, err := os.OpenRoot(*cwd)
+	return RunWorkspace(*cwd)
+}
+
+// RunWorkspace serves a workspace over the standard input/output protocol.
+func RunWorkspace(cwd string) error {
+	root, err := os.OpenRoot(cwd)
 	if err != nil {
 		return fmt.Errorf("failed to open workspace: %w", err)
 	}

@@ -1,0 +1,3 @@
+# Recordings can contain private prompts, workspace files, paths, and tool output.
+# Retain them locally; synthetic fixtures live in tests/inputs.
+/tests/sessions/

@@ -1,0 +1,23 @@
+# Run: sa-server -input tests/inputs/hello.yml
+# Logs are retained in tests/sessions/session-<UTC timestamp>.yml.
+# Replay: sa-server -replay tests/sessions/session-<UTC timestamp>.yml (no API key needed)
+# OPENAI_API_KEY supplies credentials. Optional system/developer fields tune prompts.
+version: 1
+provider:
+  name: openai
+  model: gpt-6.1-sol
+  reasoning: high
+
+services:
+  main:
+    kind: service
+    temp_workspace: true
+    files:
+      README.md: "Hello, world"
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+
+prompt: What's inside README.md?

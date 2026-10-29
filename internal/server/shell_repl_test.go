@@ -77,7 +77,7 @@ func TestSessionShellREPL(t *testing.T) {
 		{"hello", `test = "again"`, ""},
 		{"hello", `print(test)`, "again\n"},
 	} {
-		got, err := session.OnToolCall(ctx, tt.service, tt.script)
+		got, err := session.OnToolCall(ctx, "", tt.service, tt.script)
 		if err != nil || got != tt.want {
 			t.Fatalf("%s: got %q, %v; want %q", tt.script, got, err, tt.want)
 		}

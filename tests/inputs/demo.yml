@@ -1,0 +1,48 @@
+version: 1
+provider:
+  name: openai
+  model: gpt-6.1-sol
+  reasoning: high
+
+services:
+  main:
+    kind: service
+    temp_workspace: true
+    files:
+      README.md: "Hello, world"
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+
+messages:
+  - kind: system
+    text: |
+      <placeholder>
+
+  - kind: developer
+    text: |
+      Service "":
+      <placeholder>
+
+  - kind: developer
+    text: |
+      Service "main":
+      <placeholder>
+
+  - kind: user
+    text: What's inside README.md?
+
+  - kind: tool_call
+    description: Read README.md from the main workspace and print its contents and metadata.
+    service: main
+    script: print(workspace.read_file("README.md"))
+
+  - kind: tool_result
+    service: main
+    text: |
+      struct(end_line = 1, ok = True, path = "README.md", start_line = 1, text = "Hello, world", truncated = False)
+
+  - kind: end_turn
+    text: Hello, world

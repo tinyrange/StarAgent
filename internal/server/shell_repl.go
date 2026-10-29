@@ -38,6 +38,7 @@ func (f *shellREPLFactory) Create(ctx context.Context, config map[string]any) (S
 
 type shellREPLService struct {
 	args   []string
+	cwd    string
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
@@ -49,6 +50,7 @@ func (s *shellREPLService) Init(ctx context.Context) error {
 		return err
 	}
 	s.cmd = exec.Command(s.args[0], s.args[1:]...)
+	s.cmd.Dir = s.cwd
 	s.cmd.Stderr = os.Stderr
 	var err error
 	s.stdout, err = s.cmd.StdoutPipe()

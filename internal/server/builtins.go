@@ -71,7 +71,7 @@ func (s *serverService) getService(_ *starlark.Thread, fn *starlark.Builtin, arg
 			if err := starlark.UnpackArgs(fn.Name(), args, kwargs, "code", &code); err != nil {
 				return nil, err
 			}
-			output, err := s.session.OnToolCall(thread.Local("context").(context.Context), name, code)
+			output, err := s.session.OnToolCall(thread.Local("context").(context.Context), "", name, code)
 			if err != nil {
 				return nil, err
 			}

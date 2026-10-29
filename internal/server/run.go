@@ -5,7 +5,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
+	"time"
+
+	"github.com/tinyrange/staragent/internal/service"
 
 	"gopkg.in/yaml.v3"
 )
@@ -68,10 +73,27 @@ func Run() (err error) {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	testName := fs.String("run-test", "", "run a specified test YAML file")
+	inputName := fs.String("input", "", "run a session input YAML file")
+	replayName := fs.String("replay", "", "replay a session log offline and check tool results")
+	workspace := fs.String("service-workspace", "", "serve a workspace over stdio (internal)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
+	if *workspace != "" {
+		return service.RunWorkspace(*workspace)
+	}
+	modes := 0
+	for _, name := range []string{*testName, *inputName, *replayName} {
+		if name != "" {
+			modes++
+		}
+	}
+	if modes != 1 {
+		return fmt.Errorf("specify one of -run-test, -input, or -replay")
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
 
 	server := &Server{
 		providers:        make(map[string]Provider),
@@ -81,6 +103,40 @@ func Run() (err error) {
 	defer func() { err = errors.Join(err, server.Close()) }()
 	if err := server.RegisterServiceFactory("shell-repl", &shellREPLFactory{}); err != nil {
 		return err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if err := server.RegisterServiceFactory("service", &workspaceServiceFactory{command: []string{executable, "-service-workspace"}}); err != nil {
+		return err
+	}
+	if *replayName != "" {
+		var log sessionLog
+		if err := readSessionFile(*replayName, &log); err != nil {
+			return err
+		}
+		return log.replay(ctx, server)
+	}
+	if *inputName != "" {
+		var input sessionInput
+		if err := readSessionFile(*inputName, &input); err != nil {
+			return err
+		}
+		if err := server.RegisterProvider("openai", &openAIProvider{
+			key: os.Getenv("OPENAI_API_KEY"), endpoint: "https://api.openai.com/v1/responses",
+			client: &http.Client{Timeout: 5 * time.Minute},
+		}); err != nil {
+			return err
+		}
+		var output *os.File
+		output, err = createSessionLog()
+		if err != nil {
+			return err
+		}
+		defer func() { err = errors.Join(err, output.Close()) }()
+		fmt.Fprintf(os.Stderr, "Recording session to %s\n", output.Name())
+		return input.run(ctx, server, output)
 	}
 
 	if *testName != "" {

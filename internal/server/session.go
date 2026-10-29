@@ -21,13 +21,13 @@ type Session struct {
 	serviceConfigs map[string]map[string]any
 }
 
-// OnCommentaryFragment implements [TurnCallbacks].
-func (s *Session) OnCommentaryFragment(fragment string) error {
-	return fmt.Errorf("OnCommentaryFragment not implemented on Session")
+// OnMessage implements [TurnCallbacks].
+func (s *Session) OnMessage(kind, text string) error {
+	return nil
 }
 
 // OnToolCall implements [TurnCallbacks].
-func (s *Session) OnToolCall(ctx context.Context, serviceName string, line string) (string, error) {
+func (s *Session) OnToolCall(ctx context.Context, _ string, serviceName string, line string) (string, error) {
 	service, err := s.getService(ctx, serviceName)
 	if err != nil {
 		return "", err
@@ -67,7 +67,10 @@ func (s *Session) Close() error {
 		err = errors.Join(err, service.Close())
 		delete(s.services, name)
 	}
-	return errors.Join(err, s.provider.Close())
+	if s.provider != nil {
+		err = errors.Join(err, s.provider.Close())
+	}
+	return err
 }
 
 func (s *Session) Id() string                { return s.sessionId }

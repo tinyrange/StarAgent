@@ -9,17 +9,19 @@ import (
 )
 
 type ProviderConfig struct {
-	Model           string
-	ReasoningEffort string
+	Model           string `yaml:"model"`
+	ReasoningEffort string `yaml:"reasoning"`
 }
 
 type TurnInput struct {
-	Message string
+	System     string
+	Developers []string
+	Message    string
 }
 
 type TurnCallbacks interface {
-	OnCommentaryFragment(fragment string) error
-	OnToolCall(ctx context.Context, service string, line string) (string, error)
+	OnMessage(kind, text string) error
+	OnToolCall(ctx context.Context, description, service, line string) (string, error)
 }
 
 type ProviderSession interface {
@@ -45,7 +47,7 @@ type testProviderSession struct {
 // runScripts implements [serverTestProviderInterface].
 func (t *testProviderSession) runScripts(ctx context.Context, scripts []serverTestProviderScript, callbacks TurnCallbacks) error {
 	for _, script := range scripts {
-		output, err := callbacks.OnToolCall(ctx, script.Service, script.Script)
+		output, err := callbacks.OnToolCall(ctx, "", script.Service, script.Script)
 		// The REPL reports evaluation and parse errors as text in protocol v1.
 		if err == nil && (strings.Contains("\n"+output, "\nerror: ") || strings.HasPrefix(output, "<repl>:")) {
 			err = fmt.Errorf("%s", strings.TrimSpace(output))

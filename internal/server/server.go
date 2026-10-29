@@ -57,10 +57,14 @@ func (s *Server) CreateSession(providerName string, providerConfig ProviderConfi
 		return nil, fmt.Errorf("failed to make provider session: %w", err)
 	}
 
+	return s.newSession(providerSession)
+}
+
+func (s *Server) newSession(provider ProviderSession) (*Session, error) {
 	session := &Session{
 		server:    s,
 		sessionId: makeSessionId(),
-		provider:  providerSession,
+		provider:  provider,
 		services:  make(map[string]Service),
 	}
 
