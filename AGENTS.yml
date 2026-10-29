@@ -1,6 +1,16 @@
 version: 1
 
+workspace:
+  read: true
+  write: true
+
+  denied_files:
+    - AGENTS.yml
+
 environment:
   hello: |
     def hello(world):
       return "Hello, " + world
+  whoami: |
+    def whoami():
+      return privileged.shell("whoami").output()

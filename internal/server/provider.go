@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 type ProviderConfig struct {
@@ -45,7 +46,15 @@ type testProviderSession struct {
 func (t *testProviderSession) runScripts(ctx context.Context, scripts []serverTestProviderScript, callbacks TurnCallbacks) error {
 	for _, script := range scripts {
 		output, err := callbacks.OnToolCall(ctx, script.Service, script.Script)
-		if err != nil {
+		// The REPL reports evaluation and parse errors as text in protocol v1.
+		if err == nil && (strings.Contains("\n"+output, "\nerror: ") || strings.HasPrefix(output, "<repl>:")) {
+			err = fmt.Errorf("%s", strings.TrimSpace(output))
+		}
+		if script.ShouldFail {
+			if err == nil {
+				return fmt.Errorf("expected script on service %q to fail", script.Service)
+			}
+		} else if err != nil {
 			return fmt.Errorf("failed to execute: %w", err)
 		}
 		if _, err := io.WriteString(os.Stdout, output); err != nil {

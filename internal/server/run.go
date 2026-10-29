@@ -11,8 +11,9 @@ import (
 )
 
 type serverTestProviderScript struct {
-	Service string `yaml:"service"`
-	Script  string `yaml:"script"`
+	Service    string `yaml:"service"`
+	Script     string `yaml:"script"`
+	ShouldFail bool   `yaml:"should_fail"`
 }
 
 type serverTestProvider struct {

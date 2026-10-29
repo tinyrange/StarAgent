@@ -1,0 +1,28 @@
+version: 1
+provider:
+  name: test
+  scripts:
+    - service: main
+      script: print(workspace.read_file("go.mod"))
+    - service: main
+      script: |
+        workspace.mkdir("local")
+        workspace.write_file("local/hello.txt", "Hello, World")
+        print(workspace.read_file("local/hello.txt"))
+        workspace.delete_file("local/hello.txt")
+        print(workspace.exists("local/hello.txt"))
+    - service: main
+      should_fail: true
+      script: |
+        workspace.write_file("AGENTS.yml", "hello")
+    - service: main
+      should_fail: true
+      script: |
+        print(privileged.shell("whoami").output())
+    - service: main
+      script: |
+        print(whoami())
+services:
+  main:
+    kind: shell-repl
+    args: ["go", "run", "./cmd/sa-service", "-cwd", "."]

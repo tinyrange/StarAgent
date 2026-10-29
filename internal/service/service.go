@@ -3,8 +3,8 @@ package service
 import (
 	"flag"
 	"fmt"
+	"maps"
 	"os"
-	"path/filepath"
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
@@ -16,6 +16,11 @@ import (
 type agentsFile struct {
 	Version     int               `yaml:"version"`
 	Environemnt map[string]string `yaml:"environment"`
+	Workspace   struct {
+		Read        bool     `yaml:"read"`
+		Write       bool     `yaml:"write"`
+		DeniedFiles []string `yaml:"denied_files"`
+	} `yaml:"workspace"`
 }
 
 const agentsFileVersion = 1
@@ -28,7 +33,7 @@ var starlarkOptions = syntax.FileOptions{
 	Recursion:       true,
 }
 
-func loadAgentsYaml(wd string, contents []byte) (starlark.StringDict, error) {
+func loadAgentsYaml(root *os.Root, contents []byte) (starlark.StringDict, error) {
 	var agents agentsFile
 	if err := yaml.Unmarshal(contents, &agents); err != nil {
 		return nil, fmt.Errorf("failed to parse file: %w", err)
@@ -39,11 +44,20 @@ func loadAgentsYaml(wd string, contents []byte) (starlark.StringDict, error) {
 	}
 
 	ret := make(starlark.StringDict)
+	if agents.Workspace.Read || agents.Workspace.Write {
+		ret["workspace"] = &workspace{
+			root: root, read: agents.Workspace.Read, write: agents.Workspace.Write,
+			deniedFiles: agents.Workspace.DeniedFiles,
+		}
+	}
 
 	for name, script := range agents.Environemnt {
 		thread := &starlark.Thread{Name: "AGENTS.yml"}
 
-		result, err := starlark.ExecFileOptions(&starlarkOptions, thread, fmt.Sprintf("AGENTS:%s", name), script, ret)
+		// Functions retain these private bindings; the REPL only gets exports.
+		env := maps.Clone(ret)
+		env["privileged"] = &privileged{cwd: root.Name()}
+		result, err := starlark.ExecFileOptions(&starlarkOptions, thread, fmt.Sprintf("AGENTS:%s", name), script, env)
 		if err != nil {
 			return nil, fmt.Errorf("failed to execute environment script: %w", err)
 		}
@@ -67,17 +81,18 @@ func Run() error {
 		return fmt.Errorf("failed to parse args: %w", err)
 	}
 
-	wd, err := filepath.Abs(*cwd)
+	root, err := os.OpenRoot(*cwd)
 	if err != nil {
-		return fmt.Errorf("failed to resolve path: %w", err)
+		return fmt.Errorf("failed to open workspace: %w", err)
 	}
+	defer root.Close()
 
-	agents, err := os.ReadFile(filepath.Join(wd, "AGENTS.yml"))
+	agents, err := root.ReadFile("AGENTS.yml")
 	if err != nil {
 		return fmt.Errorf("failed to read AGENTS.yml: %w", err)
 	}
 
-	env, err := loadAgentsYaml(wd, agents)
+	env, err := loadAgentsYaml(root, agents)
 	if err != nil {
 		return fmt.Errorf("failed to load AGENTS.yml: %w", err)
 	}
