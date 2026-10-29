@@ -11,8 +11,10 @@ import (
 const serviceDoc = `service: Access this session's named services.
 service.list() -> list[str]: Sorted available names; does not start services.
 service.get(name: str) -> service: Get a handle without starting it; unknown names raise.
-service.get(name).exec(code: str) -> str: Start if needed, execute in its persistent REPL, and return output.
-service.get(name).help() -> str: Start if needed and return its startup documentation.`
+service.get(name).exec(code: str) -> str: Execute in its persistent REPL and return full output.
+service.get(name).get_string(name: str) -> str: Read str(variable) from the remote REPL. Strings are unchanged; other values use their Starlark text representation. name must be a variable name, not an expression.
+service.get(name).set_string(name: str, value: str) -> None: Assign a safely quoted string to a remote variable. name must be a variable name. Errors retain diagnostic output for output.read(); writes are never automatically retried.
+Example: service.get("destination").set_string("contents", service.get("source").get_string("contents"))`
 
 type documentedModule struct {
 	*starlarkstruct.Module
@@ -51,31 +53,18 @@ func (s *serverService) getService(_ *starlark.Thread, fn *starlark.Builtin, arg
 		return nil, fmt.Errorf("unknown service %q", name)
 	}
 	return &starlarkstruct.Module{Name: name, Members: starlark.StringDict{
-		"help": starlark.NewBuiltin("service.help", func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-			if err := starlark.UnpackArgs(fn.Name(), args, kwargs); err != nil {
-				return nil, err
-			}
-			ctx := thread.Local("context").(context.Context)
-			service, err := s.session.getService(ctx, name)
-			if err != nil {
-				return nil, err
-			}
-			doc, err := service.Documentation(ctx)
-			if err != nil {
-				return nil, err
-			}
-			return starlark.String(doc), nil
-		}),
 		"exec": starlark.NewBuiltin("service.exec", func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 			var code string
 			if err := starlark.UnpackArgs(fn.Name(), args, kwargs, "code", &code); err != nil {
 				return nil, err
 			}
-			output, err := s.session.OnToolCall(thread.Local("context").(context.Context), "", name, code)
+			output, err := s.session.execute(thread.Local("context").(context.Context), name, code)
 			if err != nil {
 				return nil, err
 			}
 			return starlark.String(output), nil
 		}),
+		"get_string": s.stringBuiltin(name, false),
+		"set_string": s.stringBuiltin(name, true),
 	}}, nil
 }

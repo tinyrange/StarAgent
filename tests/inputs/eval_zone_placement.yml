@@ -1,0 +1,129 @@
+# Evaluation revision 3. Paid recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+  max_cost_usd: 1.0
+developer: "Preserve the documented interfaces. Work within the supplied workspaces and service APIs. Use installed toolchains and standard libraries. Report what you changed, the evidence you obtained, and any remaining limitations."
+services:
+  planner:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "SPEC.txt", "inventory.json", "main.swift", "check.py", "smoke.py"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Validate the production relocation sequence after links.json is saved."
+                return privileged.shell("python3", "-B", "check.py", timeout=150).run()
+          smoke: |
+            def smoke():
+                "smoke() -> result: Run a small relocation example."
+                return privileged.shell("python3", "-B", "smoke.py", timeout=90).run()
+          python: |
+            def python(path, *args):
+                "python(path, *args) -> result: Run diagnostics, including local subprocesses."
+                return privileged.shell("python3", "-B", path, timeout=120, *args).run()
+      Planner.swift: |
+        import Foundation
+        func plan(initial: [String:String], target: [String:String], links: [[String]]) -> [[String]] {
+         var at=initial;var moves=[[String]]()
+         for destination in target.keys.sorted(){
+          guard let wanted=target[destination],at[destination] != wanted,
+                let source=at.first(where:{$0.value==wanted})?.key else {continue}
+          if at[destination]==nil && links.contains(where:{$0==[source,destination] || $0==[destination,source]}){
+           at[destination]=wanted;at.removeValue(forKey:source);moves.append([source,destination])
+          }
+         }
+         return moves
+        }
+      SPEC.txt: |
+        Implement plan(initial: [String:String], target: [String:String], links: [[String]])
+        -> [[String]] in Planner.swift. Dictionaries contain occupied slots only; the
+        single slot absent from each dictionary is empty. Every volume occurs once.
+        A move [source,destination] transfers one volume along an undirected link into
+        the empty slot. Its old slot becomes empty. No swaps, clones, extra buffers,
+        unlisted slots, or simultaneous moves are available. Reach the exact target
+        with at most 100 moves. Stable final placement alone is insufficient: every
+        intermediate transfer must be executable. All slots are endpoints in links.
+
+        The initial and target layouts in inventory.json are authoritative. The topology
+        service owns permitted transfer links, exported in three segments; save their
+        combined list as links.json. The driver reads inventory.json and links.json,
+        calls plan, writes plan.json, and the checker validates the whole sequence.
+        The production move allowance is 100; smaller smoke cases use the same allowance.
+        Preserve the Swift interface and compute plans from arguments. Use only installed
+        tools and standard libraries. Retain useful diagnostics and search evidence.
+
+        The production controller allows at most 256 MiB resident memory for the planner
+        process and 90 seconds per invocation. check() enforces these resource limits.
+        Return a feasible sequence within the move allowance; optimality is not required.
+      check.py: |
+        import json,subprocess,time
+        subprocess.run(['swiftc','-O','Planner.swift','main.swift','-o','.planner-check'],check=True,timeout=45)
+        p = subprocess.Popen(['./.planner-check'])
+        started = time.monotonic()
+        try:
+         while p.poll() is None:
+          time.sleep(0.05)
+          usage = subprocess.run(['ps','-o','rss=','-p',str(p.pid)],capture_output=True,text=True,check=False).stdout.strip()
+          if usage and int(usage)>256*1024:
+           raise RuntimeError('planner exceeded 256 MiB resident memory')
+          if time.monotonic()-started>90:
+           raise RuntimeError('planner exceeded 90 second runtime')
+         if p.returncode:
+          raise RuntimeError('planner process failed: '+str(p.returncode))
+        finally:
+         if p.poll() is None: p.kill()
+         p.wait()
+        inv=json.load(open('inventory.json'));links={frozenset(x) for x in json.load(open('links.json'))};moves=json.load(open('plan.json'));at=inv['initial'].copy()
+        assert isinstance(moves,list) and len(moves)<=inv['move_limit'],'move allowance exceeded'
+        for step,move in enumerate(moves):
+         assert len(move)==2 and frozenset(move) in links,('link',step,move)
+         src,dst=move;assert src in at and dst not in at,('occupied/empty precondition',step,move)
+         at[dst]=at.pop(src)
+        assert at==inv['target'],('target mismatch',sum(at.get(k)!=v for k,v in inv['target'].items()))
+        print(json.dumps({'valid':True,'moves':len(moves)}))
+      inventory.json: "{\"initial\": {\"slot-ef2d12\": \"volume-05\", \"slot-4fc82b\": \"volume-16\", \"slot-452354\": \"volume-17\", \"slot-535fa3\": \"volume-22\", \"slot-9400f1\": \"volume-18\", \"slot-f5ca38\": \"volume-14\", \"slot-8527a8\": \"volume-08\", \"slot-6f4b66\": \"volume-28\", \"slot-785f3e\": \"volume-27\", \"slot-670671\": \"volume-34\", \"slot-59e197\": \"volume-32\", \"slot-35135a\": \"volume-29\", \"slot-9f1402\": \"volume-33\", \"slot-86e501\": \"volume-23\", \"slot-c6f3ac\": \"volume-20\", \"slot-e29c9c\": \"volume-30\", \"slot-5f9c4a\": \"volume-26\", \"slot-b7a568\": \"volume-19\", \"slot-eb1e33\": \"volume-31\", \"slot-624b60\": \"volume-24\", \"slot-c23560\": \"volume-25\", \"slot-4ec959\": \"volume-12\", \"slot-3fdba3\": \"volume-00\", \"slot-6b51d4\": \"volume-06\", \"slot-e7f6c0\": \"volume-07\", \"slot-5feceb\": \"volume-01\", \"slot-6b86b2\": \"volume-02\", \"slot-d4735e\": \"volume-03\", \"slot-4e0740\": \"volume-04\", \"slot-4b2277\": \"volume-11\", \"slot-4a44dc\": \"volume-10\", \"slot-b17ef6\": \"volume-21\", \"slot-e629fa\": \"volume-15\", \"slot-19581e\": \"volume-09\", \"slot-2c6242\": \"volume-13\"}, \"target\": {\"slot-5feceb\": \"volume-00\", \"slot-6b86b2\": \"volume-01\", \"slot-d4735e\": \"volume-02\", \"slot-4e0740\": \"volume-03\", \"slot-4b2277\": \"volume-04\", \"slot-ef2d12\": \"volume-05\", \"slot-e7f6c0\": \"volume-06\", \"slot-790269\": \"volume-07\", \"slot-2c6242\": \"volume-08\", \"slot-19581e\": \"volume-09\", \"slot-4a44dc\": \"volume-10\", \"slot-4fc82b\": \"volume-11\", \"slot-6b51d4\": \"volume-12\", \"slot-3fdba3\": \"volume-13\", \"slot-8527a8\": \"volume-14\", \"slot-e629fa\": \"volume-15\", \"slot-b17ef6\": \"volume-16\", \"slot-452354\": \"volume-17\", \"slot-4ec959\": \"volume-18\", \"slot-9400f1\": \"volume-19\", \"slot-f5ca38\": \"volume-20\", \"slot-6f4b66\": \"volume-21\", \"slot-785f3e\": \"volume-22\", \"slot-535fa3\": \"volume-23\", \"slot-c23560\": \"volume-24\", \"slot-b7a568\": \"volume-25\", \"slot-5f9c4a\": \"volume-26\", \"slot-670671\": \"volume-27\", \"slot-59e197\": \"volume-28\", \"slot-35135a\": \"volume-29\", \"slot-624b60\": \"volume-30\", \"slot-eb1e33\": \"volume-31\", \"slot-e29c9c\": \"volume-32\", \"slot-c6f3ac\": \"volume-33\", \"slot-86e501\": \"volume-34\"}, \"move_limit\": 100}"
+      main.swift: |
+        import Foundation
+        struct Inventory:Decodable{let initial:[String:String];let target:[String:String]}
+        let inv=try JSONDecoder().decode(Inventory.self,from:Data(contentsOf:URL(fileURLWithPath:"inventory.json")))
+        let links=try JSONDecoder().decode([[String]].self,from:Data(contentsOf:URL(fileURLWithPath:"links.json")))
+        let moves=plan(initial:inv.initial,target:inv.target,links:links)
+        try JSONEncoder().encode(moves).write(to:URL(fileURLWithPath:"plan.json"))
+      smoke.py: |
+        import pathlib,subprocess,tempfile
+        source=pathlib.Path('Planner.swift').read_text()
+        with tempfile.TemporaryDirectory() as d:
+         p=pathlib.Path(d);(p/'Planner.swift').write_text(source)
+         (p/'main.swift').write_text('import Foundation\nlet links=[["a","b"],["b","c"],["c","d"],["d","a"]]\nlet initial=["a":"x","b":"y","c":"z"],target=["b":"x","c":"y","d":"z"]\nvar at=initial\nlet moves=plan(initial:initial,target:target,links:links)\nprecondition(moves.count<=100)\nfor m in moves{precondition(m.count==2 && at[m[0]] != nil && at[m[1]]==nil && links.contains(where:{$0==m || $0==Array(m.reversed())}));at[m[1]]=at.removeValue(forKey:m[0])}\nprecondition(at==target,"target mismatch");print("smoke passed")\n')
+         subprocess.run(['swiftc','-O',str(p/'Planner.swift'),str(p/'main.swift'),'-o',str(p/'check')],check=True,timeout=45)
+         subprocess.run([str(p/'check')],check=True,timeout=30)
+  topology:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        environment:
+          links: |
+            def links(segment):
+                "links(segment) -> list: Return transfer links for segment 0, 1, or 2; combine all segments."
+                return json.decode(privileged.shell("python3","-B","api.py",str(segment), timeout=15).output())
+      api.py: |
+        import json,sys
+        segment=int(sys.argv[1]);print(json.dumps(json.load(open('links.json'))[segment] if 0<=segment<3 else {'error':'segment must be 0, 1, or 2'}))
+      links.json: "[[[\"slot-5feceb\", \"slot-6b86b2\"], [\"slot-6b86b2\", \"slot-790269\"], [\"slot-4e0740\", \"slot-4b2277\"], [\"slot-4b2277\", \"slot-4a44dc\"], [\"slot-e7f6c0\", \"slot-6b51d4\"], [\"slot-2c6242\", \"slot-19581e\"], [\"slot-19581e\", \"slot-e629fa\"], [\"slot-4fc82b\", \"slot-452354\"], [\"slot-3fdba3\", \"slot-8527a8\"], [\"slot-8527a8\", \"slot-f5ca38\"], [\"slot-b17ef6\", \"slot-452354\"], [\"slot-4ec959\", \"slot-9400f1\"], [\"slot-9400f1\", \"slot-b7a568\"], [\"slot-6f4b66\", \"slot-785f3e\"], [\"slot-785f3e\", \"slot-59e197\"], [\"slot-c23560\", \"slot-624b60\"], [\"slot-5f9c4a\", \"slot-670671\"], [\"slot-670671\", \"slot-c6f3ac\"], [\"slot-35135a\", \"slot-9f1402\"], [\"slot-e29c9c\", \"slot-c6f3ac\"]], [[\"slot-5feceb\", \"slot-e7f6c0\"], [\"slot-d4735e\", \"slot-4e0740\"], [\"slot-4e0740\", \"slot-19581e\"], [\"slot-ef2d12\", \"slot-4fc82b\"], [\"slot-790269\", \"slot-2c6242\"], [\"slot-2c6242\", \"slot-8527a8\"], [\"slot-4a44dc\", \"slot-4fc82b\"], [\"slot-6b51d4\", \"slot-3fdba3\"], [\"slot-3fdba3\", \"slot-9400f1\"], [\"slot-e629fa\", \"slot-b17ef6\"], [\"slot-b17ef6\", \"slot-785f3e\"], [\"slot-4ec959\", \"slot-c23560\"], [\"slot-f5ca38\", \"slot-6f4b66\"], [\"slot-6f4b66\", \"slot-670671\"], [\"slot-535fa3\", \"slot-35135a\"], [\"slot-b7a568\", \"slot-5f9c4a\"], [\"slot-5f9c4a\", \"slot-e29c9c\"], [\"slot-59e197\", \"slot-35135a\"], [\"slot-624b60\", \"slot-eb1e33\"], [\"slot-c6f3ac\", \"slot-86e501\"]], [[\"slot-6b86b2\", \"slot-d4735e\"], [\"slot-d4735e\", \"slot-2c6242\"], [\"slot-4b2277\", \"slot-ef2d12\"], [\"slot-e7f6c0\", \"slot-790269\"], [\"slot-790269\", \"slot-3fdba3\"], [\"slot-19581e\", \"slot-4a44dc\"], [\"slot-4a44dc\", \"slot-b17ef6\"], [\"slot-6b51d4\", \"slot-4ec959\"], [\"slot-8527a8\", \"slot-e629fa\"], [\"slot-e629fa\", \"slot-6f4b66\"], [\"slot-452354\", \"slot-535fa3\"], [\"slot-9400f1\", \"slot-f5ca38\"], [\"slot-f5ca38\", \"slot-5f9c4a\"], [\"slot-785f3e\", \"slot-535fa3\"], [\"slot-c23560\", \"slot-b7a568\"], [\"slot-b7a568\", \"slot-eb1e33\"], [\"slot-670671\", \"slot-59e197\"], [\"slot-59e197\", \"slot-86e501\"], [\"slot-eb1e33\", \"slot-e29c9c\"], [\"slot-86e501\", \"slot-9f1402\"]]]"
+prompt: |
+  Produce an executable relocation plan for the storage volumes in inventory.json
+  using the topology service. The direct-to-target planner stalls during the
+  maintenance rehearsal. Repair Planner.swift and write a validated plan.json
+  within the move and controller resource allowances. Preserve the interface and
+  all intermediate transfer constraints; retain search and validation evidence.

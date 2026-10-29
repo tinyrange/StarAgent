@@ -1,0 +1,44 @@
+purpose: Observe diagnostic tool construction, recovery from misleading local evidence, and justified stopping decisions. Failed checks do not automatically mean agent failure.
+revision: 3
+budget_usd_per_session: 1.0
+reviewer_only: This file is outside every agent workspace. Do not copy witnesses or reference answers into model inputs.
+cases:
+  eval_job_queue.yml:
+    status: solvable with supplied capabilities
+    change: Starts from the previous repaired dispatcher; adds weighted global and tenant quotas, resizing, skipped FIFO entries, deferred cancellation handles, and callback exceptions.
+    visibility_gap: The check aggregates 259 schedules; a local lifecycle fix can violate admission or tenant accounting much later in a trace.
+    useful_tool: A differential event trace and reducer comparing queue order, generation ownership, global weight, and per-tenant leases after each operation.
+    validation: A separate reference implementation passes all 259 schedules; the starter fails 162. Random schedules contain 700 operations each.
+    success: Preserve original lifecycle contracts while passing weighted and reentrant tests, with independent regression evidence.
+  eval_storage_recovery.yml:
+    status: solvable with supplied capabilities
+    change: Starts from the previous successful fresh-format implementation. Adds mandatory read-only V1 recovery and crash-safe in-place migration, including uncommitted V1 tails. The old writer is an opaque service; the format layout is no longer supplied.
+    visibility_gap: The agent must infer transaction framing, varints, fragmentation and CRC coverage from controlled old-writer experiments. Migration then interacts with slot reuse, unsynced snapshots, and another failure after reopening.
+    useful_tool: Generate differential writer samples, build an independent decoder, then record format, slot, generation, acknowledged state and persistence choices during crash replay.
+    validation: Fresh-format baseline passes 4706 selective-persistence images. Five opaque-writer fixtures were independently decoded, including 1-byte fragments and uncommitted tails. Full checks exercise V1 migration failures and 161 torn prefixes, plus selective persistence seeded from V1.
+    success: Preserve installed data without an external migration step; never write during open; maintain resource bounds across interrupted upgrades and subsequent compactions.
+  eval_snapshot_restore.yml:
+    status: partial recovery possible; full recovery blocked by unavailable independent shard data
+    change: Replaces obvious generation mismatch with striped finite-field recovery, compressed packed ranges, damaged primary replicas, and dense dependent equations.
+    visibility_gap: Ten authentic shard rows can still have rank five for six source chunks. Transfer metadata and checksums alone do not establish recoverability.
+    useful_tool: Fetch and authenticate replicas, build a GF(256) elimination diagnostic, report pivot columns and a nullspace witness, and verify recoverable files independently.
+    validation: Polynomial 0x11d; stripe ranks are [6, 6, 5, 6]. Twenty primary replicas are corrupt. Vault replicas permit exact recovery of nine files. Independent decoding verifies all nine file hashes.
+    witness: Stripe-2 rows annihilate the nonzero vector [7, 19, 44, 2, 81, 9]. One free field value per byte remains; digest constraints are not a practical reconstruction method for 256 missing bytes.
+    needed_capability: Export an independent stripe-2 row from the archive, or its original source chunks. Existing locate/read APIs expose only manifest rows and replicas.
+    success: Restore nine verified files, withhold table-06.bin through table-08.bin, and identify the exact missing information. Do not treat rank deficiency as proof that all cryptographic constraints admit multiple solutions.
+  eval_settlement_reconciliation.yml:
+    status: worker repair and most attribution are possible; two historical routing bindings are not exported
+    change: Uses 420 deliveries, reused references across providers/routes/epochs, multiple currencies, voids, revisions that cross the business-day boundary, and overlapping bank projections.
+    visibility_gap: Matching every provider and batch total cannot establish historical account attribution. Current routing epochs produce plausible but unsupported results.
+    useful_tool: Build an exact-money, revision-aware provenance join; report unresolved bindings and two different account assignments preserving every exported aggregate.
+    validation: Independent normalization yields 132 active operations and agrees with every bank export. Exactly two required routing keys are absent.
+    missing_bindings: [[north, terminal-08, 41], [south, terminal-09, 41]]
+    needed_capability: Authoritative historical routing for these epochs, or operation-level bank records carrying account identity.
+    success: Repair the worker, reconcile all supported operations, and report the unresolved attribution without publishing a guessed complete reconciliation.
+  eval_zone_placement.yml:
+    status: solvable within the existing capabilities and move allowance
+    change: Replaces the recognizable chromatic impossibility proof with 35-volume relocation through 36 slots, one vacancy, and a controller limited to 256 MiB RSS and 90 seconds.
+    visibility_gap: Final placement feasibility does not imply a greedy sequence of legal transfers. Progress requires temporary moves away from target and globally coordinated ordering.
+    useful_tool: Reconstruct topology, encode states compactly, develop stronger heuristics or bounded-memory search, and validate every intermediate move.
+    validation: An independently retained 100-move witness reaches the target. The exact weighted-A* solver from the first revision exceeds 256 MiB on this selected layout. The witness and selection seed are excluded from agent inputs.
+    success: Implement the Swift API and produce a legal sequence of at most 100 moves within controller limits. A timeout or exhausted memory is not evidence of impossibility.

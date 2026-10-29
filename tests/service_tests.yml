@@ -4,9 +4,35 @@ provider:
   scripts:
     - service: main
       script: |
-        def check(condition, message):
+        workflows.write_file("service_test_helpers.star", r'''def check(condition, message):
           if not condition:
             fail(message)
+        ''')
+    - service: main
+      script: check = service_test_helpers.check
+
+    # Reusable workflow namespaces, validation, and next-call activation
+    - service: main
+      script: |
+        workflows.write_file("service_test_host.star", r'''def world(name="World"):
+          """Return a greeting."""
+          return "Hello, " + name
+        ''')
+    - service: main
+      script: |
+        check(service_test_host.world() == "Hello, World", "workflow not loaded")
+        check("service_test_host.world(" in help(service_test_host), "workflow help")
+        check("Return a greeting." in help(service_test_host.world), "function help")
+        workflows.edit_file("service_test_host.star", "Hello, ", "Hi, ")
+    - service: main
+      script: check(service_test_host.world("Ada") == "Hi, Ada", "workflow edit not loaded")
+    - service: main
+      should_fail: true
+      script: workflows.write_file("service_test_host.star", "def broken(:")
+    - service: main
+      script: |
+        check(service_test_host.world("Ada") == "Hi, Ada", "failed write changed workflow")
+        workflows.delete_file("service_test_host.star")
 
     # Workspace
     - service: main
@@ -153,8 +179,10 @@ provider:
         if wait(0, timeout=None, output=True) != "":
           fail("output without timeout")
     - service: timeouts
-      should_fail: true
-      script: wait(1, timeout=0.02)
+      script: |
+        result = wait(1, timeout=0.02)
+        if result.ok or not result.timed_out:
+          fail("timeout must be a failed result")
     - service: timeouts
       should_fail: true
       script: wait(1, timeout=0.02, output=True)
@@ -201,9 +229,32 @@ provider:
         print(service.get("main").exec("print(2+2)"))
     - script: |
         print(help(service))
-        print(service.get("main").help())
     - script: |
         print(json.encode({"hello": True}))
+
+    # Clipboard-style string reads and writes between services.
+    - service: main
+      script: |
+        clipboard = "quoted \"value\"\n"
+        clipboard_number = 18446744073709551615
+    - script: |
+        source = service.get("main")
+        destination = service.get("timeouts")
+        destination.set_string("clipboard", source.get_string("clipboard"))
+        destination.set_string("clipboard_number", source.get_string("clipboard_number"))
+    - service: timeouts
+      script: |
+        if clipboard != "quoted \"value\"\n" or clipboard_number != "18446744073709551615":
+            fail("copied contents changed")
+    - should_fail: true
+      script: service.get("main").get_string("missing_clipboard")
+    - script: |
+        if service.get("timeouts").get_string("clipboard") != "quoted \"value\"\n":
+            fail("clipboard lost after failed read")
+
+    - service: main
+      script: workflows.delete_file("service_test_helpers.star")
+
 services:
   main:
     kind: shell-repl

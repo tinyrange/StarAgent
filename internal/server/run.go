@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"time"
 
 	"github.com/tinyrange/staragent/internal/service"
@@ -75,6 +76,14 @@ func Run() (err error) {
 	testName := fs.String("run-test", "", "run a specified test YAML file")
 	inputName := fs.String("input", "", "run a session input YAML file")
 	replayName := fs.String("replay", "", "replay a session log offline and check tool results")
+	var replayIgnore []*regexp.Regexp
+	fs.Func("replay-ignore", "explicit regexp to ignore in replay comparisons only (repeatable; raw recordings remain intact)", func(pattern string) error {
+		compiled, err := regexp.Compile(pattern)
+		if err == nil {
+			replayIgnore = append(replayIgnore, compiled)
+		}
+		return err
+	})
 	workspace := fs.String("service-workspace", "", "serve a workspace over stdio (internal)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -116,7 +125,7 @@ func Run() (err error) {
 		if err := readSessionFile(*replayName, &log); err != nil {
 			return err
 		}
-		return log.replay(ctx, server)
+		return log.replay(ctx, server, replayIgnore...)
 	}
 	if *inputName != "" {
 		var input sessionInput

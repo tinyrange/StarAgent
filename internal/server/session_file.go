@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -38,14 +39,17 @@ type sessionLog struct {
 }
 
 type sessionMessage struct {
-	Timestamp   time.Time   `yaml:"timestamp,omitempty"`
-	Kind        string      `yaml:"kind"`
-	Description string      `yaml:"description,omitempty"`
-	Service     string      `yaml:"service,omitempty"`
-	Script      string      `yaml:"script,omitempty"`
-	Text        string      `yaml:"text,omitempty"`
-	Error       string      `yaml:"error,omitempty"`
-	Usage       *TokenUsage `yaml:"usage,omitempty"`
+	Timestamp   time.Time         `yaml:"timestamp,omitempty"`
+	Kind        string            `yaml:"kind"`
+	Description string            `yaml:"description,omitempty"`
+	Service     string            `yaml:"service,omitempty"`
+	Script      string            `yaml:"script,omitempty"`
+	Text        string            `yaml:"text,omitempty"`
+	FullText    string            `yaml:"full_text,omitempty"`
+	Outputs     map[string]string `yaml:"outputs,omitempty"` // Retained diagnostics, not sent to the model.
+	Error       string            `yaml:"error,omitempty"`
+	Usage       *TokenUsage       `yaml:"usage,omitempty"`
+	Cost        *SessionCost      `yaml:"cost,omitempty"`
 }
 
 func createSessionLog() (*os.File, error) {
@@ -92,6 +96,7 @@ func (c *sessionConfig) validate(server *Server) error {
 
 const defaultSystem = `You are an agent working through persistent Starlark REPLs, one per service.
 Scripts use Starlark, not Python; use Starlark syntax and builtins.
+AGENTS.yml is harness configuration, not agent guidelines.
 Use exec(description, service, script) to run Starlark. Every call must include a description field containing one sentence explaining what the code does. The empty service name selects the server REPL.
 Inspect results and use the documented APIs to accomplish the user's task. Print values you need to see.
 Keep changes minimal and give a concise final answer.`
@@ -108,7 +113,10 @@ func (input *sessionInput) run(ctx context.Context, server *Server, output io.Wr
 		return err
 	}
 	session.serviceConfigs = input.Services
-	if err := yaml.NewEncoder(output).Encode(input.sessionConfig); err != nil {
+	config := input.sessionConfig
+	limit := session.Cost().LimitUSD
+	config.Provider.MaxCostUSD = &limit
+	if err := yaml.NewEncoder(output).Encode(config); err != nil {
 		return err
 	}
 	if _, err := io.WriteString(output, "messages:\n"); err != nil {
@@ -167,27 +175,92 @@ func (r *recordedTurn) write(message sessionMessage) error {
 	return yaml.NewEncoder(r.output).Encode([]sessionMessage{message})
 }
 
+// yaml.v3's block-scalar emitter loses an initial newline and can emit invalid
+// indentation for leading whitespace. Build message scalars directly so those
+// values can be quoted before the emitter sees them; ordinary scripts stay readable.
+func (m sessionMessage) MarshalYAML() (any, error) {
+	node := &yaml.Node{Kind: yaml.MappingNode}
+	for _, field := range []struct {
+		name  string
+		value any
+		omit  bool
+	}{
+		{"timestamp", m.Timestamp, m.Timestamp.IsZero()},
+		{"kind", m.Kind, false},
+		{"description", m.Description, m.Description == ""},
+		{"service", m.Service, m.Service == ""},
+		{"script", m.Script, m.Script == ""},
+		{"text", m.Text, m.Text == ""},
+		{"full_text", m.FullText, m.FullText == ""},
+		{"outputs", m.Outputs, len(m.Outputs) == 0},
+		{"error", m.Error, m.Error == ""},
+		{"usage", m.Usage, m.Usage == nil},
+		{"cost", m.Cost, m.Cost == nil},
+	} {
+		if field.omit {
+			continue
+		}
+		value := &yaml.Node{}
+		if outputs, ok := field.value.(map[string]string); ok {
+			value.Kind = yaml.MappingNode
+			for _, id := range slices.Sorted(maps.Keys(outputs)) {
+				value.Content = append(value.Content,
+					&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: id},
+					&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: outputs[id], Style: yaml.DoubleQuotedStyle})
+			}
+		} else if text, ok := field.value.(string); ok {
+			value.Kind, value.Tag, value.Value = yaml.ScalarNode, "!!str", text
+			if len(text) > 0 && strings.ContainsRune(" \t\r\n", rune(text[0])) {
+				value.Style = yaml.DoubleQuotedStyle
+			}
+		} else if err := value.Encode(field.value); err != nil {
+			return nil, err
+		}
+		node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: field.name}, value)
+	}
+	return node, nil
+}
+
 func (r *recordedTurn) OnMessage(kind, text string) error {
-	return r.write(sessionMessage{Kind: kind, Text: text})
+	message := sessionMessage{Kind: kind, Text: text}
+	if (kind == "error" || kind == "end_turn") && r.session.provider != nil {
+		cost := r.session.Cost()
+		message.Cost = &cost
+	}
+	return r.write(message)
 }
 
 func (r *recordedTurn) OnUsage(usage TokenUsage) error {
-	return r.write(sessionMessage{Kind: "usage", Usage: &usage})
+	cost := r.session.Cost()
+	return r.write(sessionMessage{Kind: "usage", Usage: &usage, Cost: &cost})
 }
 
 func (r *recordedTurn) OnToolCall(ctx context.Context, description, service, script string) (string, error) {
-	if err := r.write(sessionMessage{Kind: "tool_call", Description: description, Service: service, Script: script}); err != nil {
+	message := sessionMessage{Kind: "tool_call", Description: description, Service: service, Script: script}
+	if err := r.write(message); err != nil {
 		return "", err
 	}
+	before := len(r.session.outputs)
 	text, callErr := r.session.OnToolCall(ctx, description, service, script)
 	result := sessionMessage{Kind: "tool_result", Service: service, Text: text}
+	end := len(r.session.outputs)
+	if r.session.lastOutput != text {
+		result.FullText = r.session.lastOutput
+		end-- // The final preview is already recorded as full_text.
+	}
+	for i := before; i < end; i++ {
+		if result.Outputs == nil {
+			result.Outputs = make(map[string]string)
+		}
+		result.Outputs[fmt.Sprintf("out-%d", i+1)] = r.session.outputs[i]
+	}
 	if callErr != nil {
 		result.Error = callErr.Error()
 	}
 	return text, errors.Join(callErr, r.write(result))
 }
 
-func (log *sessionLog) replay(ctx context.Context, server *Server) error {
+func (log *sessionLog) replay(ctx context.Context, server *Server, ignore ...*regexp.Regexp) error {
 	if err := log.validate(server); err != nil {
 		return err
 	}
@@ -227,7 +300,18 @@ func (log *sessionLog) replay(ctx context.Context, server *Server) error {
 			gotError = callErr.Error()
 		}
 		want := log.Messages[i+1]
-		if normalizeReplayOutput(text) != normalizeReplayOutput(want.Text) || normalizeReplayOutput(gotError) != normalizeReplayOutput(want.Error) {
+		for id, expected := range want.Outputs {
+			var n int
+			if _, err := fmt.Sscanf(id, "out-%d", &n); err != nil || id != fmt.Sprintf("out-%d", n) || n < 1 || n > len(session.outputs) || normalizeReplayOutput(session.outputs[n-1], ignore...) != normalizeReplayOutput(expected, ignore...) {
+				return fmt.Errorf("message %d: retained output %q mismatch", i+1, id)
+			}
+		}
+		if want.FullText != "" {
+			text, want.Text = session.lastOutput, want.FullText
+		} else if len(want.Text) > outputLimit {
+			text = session.lastOutput // Older recordings predate previews.
+		}
+		if normalizeReplayOutput(text, ignore...) != normalizeReplayOutput(want.Text, ignore...) || normalizeReplayOutput(gotError, ignore...) != normalizeReplayOutput(want.Error, ignore...) {
 			return fmt.Errorf("message %d, service %q: result mismatch\nwant text: %q\n got text: %q\nwant error: %q\n got error: %q", i+1, message.Service, want.Text, text, want.Error, gotError)
 		}
 	}

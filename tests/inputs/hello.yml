@@ -7,6 +7,9 @@ provider:
   name: openai
   model: gpt-6.1-sol
   reasoning: high
+  # Per-session USD allowance; defaults to 0.50 when omitted. Zero blocks calls.
+  # Cost tracking stays enabled when the limit changes.
+  max_cost_usd: 0.50
 
 services:
   main:

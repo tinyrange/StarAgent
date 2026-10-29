@@ -19,6 +19,8 @@ type Session struct {
 	provider       ProviderSession
 	services       map[string]Service
 	serviceConfigs map[string]map[string]any
+	outputs        []string
+	lastOutput     string
 }
 
 // OnMessage implements [TurnCallbacks].
@@ -30,6 +32,12 @@ func (s *Session) OnUsage(usage TokenUsage) error { return nil }
 
 // OnToolCall implements [TurnCallbacks].
 func (s *Session) OnToolCall(ctx context.Context, _ string, serviceName string, line string) (string, error) {
+	text, err := s.execute(ctx, serviceName, line)
+	s.lastOutput = text
+	return s.presentOutput(text), err
+}
+
+func (s *Session) execute(ctx context.Context, serviceName, line string) (string, error) {
 	if _, running := s.services[serviceName]; !running {
 		if _, configured := s.serviceConfigs[serviceName]; !configured {
 			return fmt.Sprintf("error: unknown service %q\n", serviceName), nil
@@ -82,6 +90,19 @@ func (s *Session) Close() error {
 
 func (s *Session) Id() string                { return s.sessionId }
 func (s *Session) Provider() ProviderSession { return s.provider }
+
+func (s *Session) Cost() SessionCost {
+	if s.provider == nil {
+		return SessionCost{LimitUSD: DefaultMaxCostUSD}
+	}
+	return s.provider.Cost()
+}
+func (s *Session) SetCostLimitUSD(limit float64) error {
+	if s.provider == nil {
+		return fmt.Errorf("session has no provider")
+	}
+	return s.provider.SetCostLimitUSD(limit)
+}
 
 func (s *Session) RegisterService(ctx context.Context, name string, service Service) error {
 	if _, ok := s.services[name]; ok {

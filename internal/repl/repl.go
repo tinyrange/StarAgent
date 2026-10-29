@@ -18,6 +18,7 @@ type Options struct {
 	Thread        *starlark.Thread
 	Environment   starlark.StringDict
 	Documentation string
+	Prepare       func(*syntax.File) error
 
 	Input  io.Reader
 	Output io.Writer
@@ -63,6 +64,12 @@ func Evaluate(opts Options, input string, output io.Writer) error {
 	if err != nil {
 		_, writeErr := fmt.Fprintf(output, "%v\n", err)
 		return writeErr
+	}
+	if opts.Prepare != nil {
+		if err := opts.Prepare(parsed); err != nil {
+			_, writeErr := fmt.Fprintf(output, "error: %v\n", err)
+			return writeErr
+		}
 	}
 
 	var printErr error

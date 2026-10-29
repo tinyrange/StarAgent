@@ -37,10 +37,18 @@ func (p *openAIProvider) MakeSession(config ProviderConfig) (ProviderSession, er
 	if config.Model == "" {
 		return nil, fmt.Errorf("provider.model is required")
 	}
-	return &openAISession{provider: p, config: config}, nil
+	if config.Model != "gpt-6.1-sol" {
+		return nil, fmt.Errorf("no verified pricing for model %q", config.Model)
+	}
+	cost, err := newCostTracker(config)
+	if err != nil {
+		return nil, err
+	}
+	return &openAISession{provider: p, config: config, costTracker: cost}, nil
 }
 
 type openAISession struct {
+	costTracker
 	provider *openAIProvider
 	config   ProviderConfig
 	history  []json.RawMessage
@@ -164,36 +172,35 @@ func (s *openAISession) RunTurn(ctx context.Context, input TurnInput, callbacks 
 }
 
 func (s *openAISession) respond(ctx context.Context, callbacks TurnCallbacks) ([]json.RawMessage, error) {
+	if _, _, err := s.outputAllowance(0); err != nil {
+		return nil, err
+	}
 	reasoning := map[string]string{"summary": "auto"}
 	if s.config.ReasoningEffort != "" {
 		reasoning["effort"] = s.config.ReasoningEffort
 	}
-	body, err := json.Marshal(map[string]any{
+	body := map[string]any{
 		"model": s.config.Model, "input": s.history,
 		"tools": []json.RawMessage{executionTool}, "parallel_tool_calls": false,
-		"reasoning": reasoning, "store": false,
-	})
+		"reasoning": reasoning,
+	}
+	var count struct {
+		InputTokens *int `json:"input_tokens"`
+	}
+	if err := s.provider.post(ctx, "/input_tokens", body, &count); err != nil {
+		return nil, fmt.Errorf("count input tokens: %w", err)
+	}
+	if count.InputTokens == nil {
+		return nil, fmt.Errorf("missing input token count")
+	}
+	maxOutput, reserved, err := s.outputAllowance(*count.InputTokens)
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, s.provider.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("Authorization", "Bearer "+s.provider.key)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := s.provider.client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	data, err := io.ReadAll(response.Body)
-	if err != nil {
-		return nil, err
-	}
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("OpenAI HTTP %d: %s", response.StatusCode, data)
-	}
+	body["store"] = false
+	body["max_output_tokens"] = maxOutput
+	body["service_tier"] = "default"
+	body["prompt_cache_options"] = map[string]string{"ttl": "30m"}
 	var result struct {
 		Usage             *TokenUsage       `json:"usage"`
 		Status            string            `json:"status"`
@@ -201,16 +208,58 @@ func (s *openAISession) respond(ctx context.Context, callbacks TurnCallbacks) ([
 		Error             json.RawMessage   `json:"error"`
 		IncompleteDetails json.RawMessage   `json:"incomplete_details"`
 	}
-	if err := json.Unmarshal(data, &result); err != nil {
+	previous := s.cost.SpentUSD
+	s.cost.SpentUSD += reserved
+	s.cost.Estimated = true
+	if err := s.provider.post(ctx, "", body, &result); err != nil {
 		return nil, err
 	}
-	if result.Usage != nil {
-		if err := callbacks.OnUsage(*result.Usage); err != nil {
-			return nil, err
-		}
+	if result.Usage == nil {
+		return nil, fmt.Errorf("OpenAI response missing usage; cost reservation retained")
+	}
+	charge, costErr := usageCost(*result.Usage)
+	if costErr == nil {
+		s.cost.SpentUSD = previous + charge
+		s.cost.Estimated = false
+	}
+	if err := callbacks.OnUsage(*result.Usage); err != nil {
+		return nil, err
+	}
+	if costErr != nil {
+		return nil, costErr
+	}
+	if charge > reserved || s.cost.SpentUSD > s.cost.LimitUSD {
+		s.cost.Estimated = true // Do not allow another request with inconsistent accounting.
+		return nil, fmt.Errorf("OpenAI usage exceeded the reserved session cost")
 	}
 	if result.Status != "completed" {
 		return nil, fmt.Errorf("OpenAI response status %q: error=%s incomplete_details=%s", result.Status, result.Error, result.IncompleteDetails)
 	}
 	return result.Output, nil
+}
+
+func (p *openAIProvider) post(ctx context.Context, suffix string, body any, result any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(p.endpoint, "/")+suffix, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+p.key)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := p.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	data, err = io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("OpenAI HTTP %d: %s", response.StatusCode, data)
+	}
+	return json.Unmarshal(data, result)
 }

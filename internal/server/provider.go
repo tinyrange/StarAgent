@@ -9,8 +9,9 @@ import (
 )
 
 type ProviderConfig struct {
-	Model           string `yaml:"model"`
-	ReasoningEffort string `yaml:"reasoning"`
+	Model           string   `yaml:"model"`
+	ReasoningEffort string   `yaml:"reasoning"`
+	MaxCostUSD      *float64 `yaml:"max_cost_usd,omitempty"`
 }
 
 type TurnInput struct {
@@ -42,6 +43,8 @@ type TokenUsage struct {
 
 type ProviderSession interface {
 	io.Closer
+	Cost() SessionCost
+	SetCostLimitUSD(limit float64) error
 	RunTurn(ctx context.Context, input TurnInput, callbacks TurnCallbacks) error
 }
 
@@ -54,10 +57,12 @@ type testProvider struct {
 
 // MakeSession implements [Provider].
 func (t *testProvider) MakeSession(config ProviderConfig) (ProviderSession, error) {
-	return &testProviderSession{}, nil
+	cost, err := newCostTracker(config)
+	return &testProviderSession{costTracker: cost}, err
 }
 
 type testProviderSession struct {
+	costTracker
 }
 
 // runScripts implements [serverTestProviderInterface].

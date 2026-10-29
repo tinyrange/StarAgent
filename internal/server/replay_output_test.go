@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"regexp"
 	"testing"
 )
 
@@ -17,6 +18,9 @@ func TestReplayOutputNormalization(t *testing.T) {
 		{"linux roots", "/tmp/staragent-123/source.c", "/var/tmp/staragent-456/source.c", true},
 		{"Go summary", quoted("ok  \texample.test/page\t0.004s\n"), quoted("ok  \texample.test/page\t1.234s\n"), true},
 		{"Go failure", quoted("--- FAIL: TestPage (0.00s)\n    page_test.go:8: wrong\nFAIL\texample.test/page\t0.004s\n"), quoted("--- FAIL: TestPage (2.00s)\n    page_test.go:8: wrong\nFAIL\texample.test/page\t2.004s\n"), true},
+		{"unittest timing", quoted("Ran 13 tests in 0.032s\n\nOK\n"), quoted("Ran 13 tests in 0.044s\n\nOK\n"), true},
+		{"unittest count", quoted("Ran 13 tests in 0.032s\n\nOK\n"), quoted("Ran 12 tests in 0.032s\n\nOK\n"), false},
+		{"unittest outcome", quoted("Ran 13 tests in 0.032s\n\nOK\n"), quoted("Ran 13 tests in 0.032s\n\nFAILED\n"), false},
 		{"different file", "/tmp/staragent-123/a.c", "/tmp/staragent-456/b.c", false},
 		{"different assertion", quoted("at /tmp/staragent-123/check.js:7:8\n4000 != 0"), quoted("at /tmp/staragent-456/check.js:8:8\n4000 != 1"), false},
 		{"test outcome", quoted("ok  \texample.test/page\t0.004s\n"), quoted("FAIL\texample.test/page\t0.008s\n"), false},
@@ -31,6 +35,21 @@ func TestReplayOutputNormalization(t *testing.T) {
 				t.Fatalf("equal=%v, want %v\nbefore: %s\nafter: %s", got, tt.equal, normalizeReplayOutput(tt.before), normalizeReplayOutput(tt.after))
 			}
 		})
+	}
+}
+
+func TestReplayExplicitIgnore(t *testing.T) {
+	ignore := regexp.MustCompile(`seconds=[0-9]+\.[0-9]+`)
+	a := `struct(stdout = "moves=96 seconds=0.32\n")`
+	b := `struct(stdout = "moves=96 seconds=0.45\n")`
+	if normalizeReplayOutput(a) == normalizeReplayOutput(b) {
+		t.Fatal("ignored application timing by default")
+	}
+	if normalizeReplayOutput(a, ignore) != normalizeReplayOutput(b, ignore) {
+		t.Fatal("explicit ignore failed")
+	}
+	if normalizeReplayOutput(a, ignore) == normalizeReplayOutput(`struct(stdout = "moves=97 seconds=0.45\n")`, ignore) {
+		t.Fatal("ignored the actual result")
 	}
 }
 

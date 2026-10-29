@@ -34,7 +34,7 @@ func (s *serverService) Close() error {
 
 // Documentation implements [Service].
 func (s *serverService) Documentation(ctx context.Context) (string, error) {
-	return serviceDoc + "\n\n" + repl.PrintDoc, nil
+	return serviceDoc + "\n\n" + outputDoc + "\n\n" + repl.PrintDoc, nil
 }
 
 // ExecuteLine implements [Service].
@@ -49,8 +49,9 @@ func (s *serverService) ExecuteLine(ctx context.Context, line string) (string, e
 
 func (s *serverService) Init(ctx context.Context) error {
 	s.declared = starlark.StringDict{
-		"help": starlark.NewBuiltin("help", repl.Help),
-		"json": repl.JSON,
+		"help":   starlark.NewBuiltin("help", repl.Help),
+		"json":   repl.JSON,
+		"output": s.session.outputModule(),
 		"service": &documentedModule{
 			Module: &starlarkstruct.Module{Name: "service", Members: starlark.StringDict{
 				"list": starlark.NewBuiltin("service.list", s.listServices),

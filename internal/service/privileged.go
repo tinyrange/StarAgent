@@ -29,7 +29,7 @@ func (p *privileged) Attr(name string) (starlark.Value, error) {
 	if name == "shell" {
 		return &documentedBuiltin{
 			Builtin: starlark.NewBuiltin("privileged.shell", p.shell),
-			doc:     "privileged.shell(*args: str, env: dict[str, str] = {}, wd: str = '.', timeout=None) -> shell_command: Execute argv without shell expansion. env overrides inherited variables; relative wd is based on the workspace. timeout is positive seconds, counted when run()/output() starts; None disables it. Timeouts raise. output() returns stdout; run() returns a result.",
+			doc:     "privileged.shell(*args: str, env: dict[str, str] = {}, wd: str = '.', timeout=None) -> shell_command: Execute argv without shell expansion. env overrides inherited variables; relative wd is based on the workspace. timeout is positive seconds, counted when run()/output() starts; None disables it. run() preserves stdout/stderr even on timeout; output() returns stdout or raises with captured output.",
 		}, nil
 	}
 	return nil, nil
@@ -98,7 +98,7 @@ func (c *shellCommand) Attr(name string) (starlark.Value, error) {
 	if name == "run" {
 		return &documentedBuiltin{
 			Builtin: starlark.NewBuiltin("shell_command.run", c.run),
-			doc:     "run() -> struct(ok: bool, exit_code: int, stdout: str, stderr: str): Execute with the configured argv, env, wd, and timeout. Nonzero exits are results; launch errors and timeouts raise.",
+			doc:     "run() -> {ok, exit_code, stdout, stderr, timed_out}: Execute with configured argv, env, wd, and timeout. Nonzero exits and timeouts are results with captured output; exit_code=-1 when no exit status is available. Launch errors raise.",
 		}, nil
 	}
 	return nil, nil
@@ -127,12 +127,16 @@ func (c *shellCommand) output(_ *starlark.Thread, fn *starlark.Builtin, args sta
 	}
 	cmd, ctx, cancel := c.command()
 	defer cancel()
-	cmd.Stderr = os.Stderr
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	output, err := cmd.Output()
 	if ctx.Err() != nil {
-		return nil, fmt.Errorf("command timed out after %s: %w", c.timeout, ctx.Err())
+		return nil, fmt.Errorf("command timed out after %s: %w; stdout=%q stderr=%q", c.timeout, ctx.Err(), output, stderr.String())
 	}
 	if err != nil {
+		return nil, fmt.Errorf("command: %w; stdout=%q stderr=%q", err, output, stderr.String())
+	}
+	if _, err := os.Stderr.Write(stderr.Bytes()); err != nil {
 		return nil, err
 	}
 	return starlark.String(output), nil
@@ -147,16 +151,19 @@ func (c *shellCommand) run(_ *starlark.Thread, fn *starlark.Builtin, args starla
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
-	if ctx.Err() != nil {
-		return nil, fmt.Errorf("command timed out after %s: %w", c.timeout, ctx.Err())
-	}
+	timedOut := ctx.Err() != nil
 	var exitErr *exec.ExitError
-	if err != nil && !errors.As(err, &exitErr) {
+	if err != nil && !timedOut && !errors.As(err, &exitErr) {
 		return nil, fmt.Errorf("shell: %w: %s", err, stderr.String())
 	}
+	exitCode := -1
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
 	return starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{
-		"ok": starlark.Bool(err == nil), "exit_code": starlark.MakeInt(cmd.ProcessState.ExitCode()),
+		"ok": starlark.Bool(err == nil && !timedOut), "exit_code": starlark.MakeInt(exitCode),
 		"stdout": starlark.String(stdout.String()), "stderr": starlark.String(stderr.String()),
+		"timed_out": starlark.Bool(timedOut),
 	}), nil
 }
 

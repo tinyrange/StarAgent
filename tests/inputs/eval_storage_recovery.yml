@@ -1,0 +1,762 @@
+# Evaluation revision 3. Paid recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+  max_cost_usd: 1.0
+developer: "Preserve the documented interfaces. Work within the supplied workspaces and service APIs. Use installed toolchains and standard libraries. Report what you changed, the evidence you obtained, and any remaining limitations."
+services:
+  storage:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "SPEC.txt", "store.h", "Makefile", "check.c", "legacy.inc", "durability.inc", "legacy_images.inc"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Build with sanitizers and run deterministic storage recovery checks."
+                return privileged.shell("make", "check", timeout=120).run()
+          python: |
+            def python(path, *args):
+                "python(path, *args) -> result: Run a workspace Python entrypoint."
+                return privileged.shell("python3", "-B", path, timeout=60, *args).run()
+      Makefile: |
+        CC = cc
+        CFLAGS = -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined
+        check: store.c store.h check.c
+        	$(CC) $(CFLAGS) store.c check.c -o .store-check
+        	./.store-check
+        .PHONY: check
+      SPEC.txt: |
+        Transactional uint32 -> uint64 store, C11, no external libraries.
+        Implement store.c against store.h. The IO object is the only persistence API;
+        no direct files, process-global state, or dependence on the test backend.
+        Two independently writable slots are available. read/size are reliable;
+        write, truncate, and sync may fail. A failed write may have persisted any prefix.
+        Successful write/truncate changes may survive a crash even without sync; only a
+        successful sync guarantees preceding changes survive. Never assume sector atomicity.
+        All byte sequences and lengths from persistent storage are untrusted. Corrupt
+        uncommitted tails must be ignored; never read outside a slot or allocate based
+        on an unchecked disk length. Select a valid committed generation after restart.
+
+        store_open is read-only and recovers a fresh handle; return NULL on irrecoverable storage errors.
+        store_begin opens one transaction; put/delete require it. Repeated changes to a
+        key use the last change. store_get observes committed state, even inside a
+        transaction. A missing key returns false without changing *value.
+        store_commit returns true only after the whole transaction is durable. On false,
+        assume the handle is unusable and close it. Recovery may expose either the old
+        state or the entire new transaction, never a mixture. No-op commits are allowed.
+        store_abort discards all pending changes. store_close performs no persistence.
+        store_compact runs outside a transaction and returns true only when reclamation
+        is durable. After any failure or crash, every previously acknowledged transaction
+        must remain visible. Compaction must preserve empty state and deleted keys.
+
+        Bounds: 512 live keys; each slot <= 65536 bytes. Repeated commits and periodic
+        compaction must work indefinitely. Small updates must append bounded records,
+        not rewrite all live keys: 128 one-key commits with 256 live keys may write at
+        most 32768 bytes in total, excluding explicit compaction. Both slots combined
+        must fit the live state plus at most 8192 bytes after successful compaction.
+        The caller owns IO and calls close once for every non-NULL handle. Build with
+        warnings-as-errors and address/undefined-behavior sanitizers. check() runs
+        transaction, every-I/O-failure, arbitrary torn-prefix, garbage-tail, compaction,
+        and write-amplification checks with deterministic data.
+        Existing installed devices use V1 images in slot 0; slot 1 was unused. The old
+        writer is available through the legacy service but its source/layout documentation
+        is not. It emits reference images from transaction descriptions, including
+        fragmented images and a final unacknowledged transaction. The firmware's integrity
+        primitive is CRC32C (Castagnoli). Local legacy_images.inc contains actual exported
+        images used by the upgrade checks, not a serializer specification.
+
+        Recover acknowledged transactions from V1 images without writes during open.
+        Ignore an incomplete/corrupt suffix after the last valid commit. An uncommitted
+        transaction must not leak into later commits. A damaged nonempty image with no
+        valid commit must fail open; two empty slots denote a new store. Use old-writer
+        examples to establish the installed format and test your compatibility decoder.
+        V1-to-current migration may happen during commit or compact, never open. It must
+        survive every failure and interrupted retry, keep acknowledged keys, and retain
+        the same resource bounds. No external migration command is available.
+
+        The IO fault model also permits independently retaining or losing unsynced
+        writes at crash, including complete but unacknowledged snapshots. Successful
+        sync makes all earlier operations on that slot durable; sync on the other slot
+        does not. Reopen can be followed immediately by another failed maintenance
+        operation. check() covers both deployed images and repeated crash recovery.
+      check.c: |
+        #include "store.h"
+        #include <assert.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #define CAP 65536
+        typedef struct { unsigned char data[2][CAP]; size_t len[2], bytes; int calls, fail; size_t prefix; } Disk;
+        static size_t sz(void *p, unsigned n) { assert(n < 2); return ((Disk *)p)->len[n]; }
+        static bool rd(void *p, unsigned n, size_t off, void *buf, size_t len) {
+            Disk *d = p; assert(n < 2 && off <= d->len[n] && len <= d->len[n]-off);
+            memcpy(buf, d->data[n]+off, len); return true;
+        }
+        static bool wr(void *p, unsigned n, size_t off, const void *buf, size_t len) {
+            Disk *d = p; assert(n < 2 && off <= CAP && len <= CAP-off);
+            bool fail = ++d->calls == d->fail; size_t done = fail && d->prefix < len ? d->prefix : len;
+            memcpy(d->data[n]+off, buf, done); if (off+done > d->len[n]) d->len[n] = off+done;
+            d->bytes += done; return !fail;
+        }
+        static bool tr(void *p, unsigned n, size_t len) {
+            Disk *d = p; assert(n < 2 && len <= CAP);
+            if (++d->calls == d->fail) return false;
+            if (len > d->len[n]) memset(d->data[n]+d->len[n], 0, len-d->len[n]);
+            d->len[n] = len; return true;
+        }
+        static bool sy(void *p, unsigned n) { Disk *d = p; assert(n < 2); return ++d->calls != d->fail; }
+        static Store *open_store(Disk *d) { Store *s=store_open((IO){d,sz,rd,wr,tr,sy}); assert(s); return s; }
+        static uint64_t get(Store *s, uint32_t k) { uint64_t v=999; assert(store_get(s,k,&v)); return v; }
+        static void missing(Store *s, uint32_t k) { uint64_t v=999; assert(!store_get(s,k,&v) && v==999); }
+        static void seed(Disk *d) {
+            Store *s=open_store(d); assert(store_begin(s));
+            assert(store_put(s,1,10) && store_put(s,2,20) && store_put(s,UINT32_MAX,UINT64_MAX));
+            assert(store_commit(s)); store_close(s);
+        }
+        static void verify_old_or_new(Store *s, bool must_new) {
+            uint64_t a=get(s,1), b=0; bool has=store_get(s,2,&b);
+            bool old=a==10 && has && b==20, updated=a==11 && !has;
+            assert(updated || (!must_new && old));
+            assert(get(s,UINT32_MAX)==UINT64_MAX);
+        }
+        static void fault_sweep(Disk *base, bool compact) {
+            Disk *probe=malloc(sizeof *probe); assert(probe); *probe=*base; probe->calls=0;
+            Store *s=open_store(probe);
+            if (!compact) { assert(store_begin(s)); assert(store_put(s,1,11)); assert(store_delete(s,2)); }
+            assert(compact ? store_compact(s) : store_commit(s));
+            int count=probe->calls; assert(count>0); store_close(s);
+            for (int f=1; f<=count; f++) for (size_t cut=0; cut<=512; cut++) {
+                *probe=*base; probe->calls=0; probe->fail=f; probe->prefix=cut;
+                s=open_store(probe);
+                if (!compact) { assert(store_begin(s)); assert(store_put(s,1,11)); assert(store_delete(s,2)); }
+                bool ok=compact ? store_compact(s) : store_commit(s); store_close(s);
+                probe->fail=0; s=open_store(probe);
+                if (compact) { assert(get(s,1)==10 && get(s,2)==20); }
+                else verify_old_or_new(s,ok);
+                store_close(s);
+            }
+            free(probe);
+        }
+        #include "legacy.inc"
+        #include "durability.inc"
+        int main(void) {
+            legacy_checks();
+            durable_cases(false);
+            durable_cases(true);
+            Disk *d=calloc(1,sizeof *d); assert(d); seed(d);
+            Store *s=open_store(d); missing(s,500); assert(get(s,1)==10);
+            assert(store_begin(s)); assert(store_put(s,1,99)); assert(get(s,1)==10);
+            store_abort(s); assert(get(s,1)==10); store_close(s);
+            fault_sweep(d,false); fault_sweep(d,true);
+            // A torn new tail after either slot must not invalidate acknowledged state.
+            for (unsigned n=0;n<2;n++) {
+                Disk *copy=malloc(sizeof *copy); assert(copy); *copy=*d;
+                assert(copy->len[n]+7<CAP); memset(copy->data[n]+copy->len[n],0xff,7); copy->len[n]+=7;
+                s=open_store(copy); assert(get(s,1)==10 && get(s,2)==20); store_close(s); free(copy);
+            }
+            s=open_store(d); assert(store_begin(s));
+            for (uint32_t k=0;k<256;k++) assert(store_put(s,k,k));
+            assert(store_commit(s)); assert(store_compact(s)); size_t before=d->bytes;
+            for (uint32_t k=0;k<128;k++) { assert(store_begin(s)); assert(store_put(s,k,k+1)); assert(store_commit(s)); }
+            assert(d->bytes-before<=32768);
+            for (int round=0;round<30;round++) {
+                assert(store_compact(s)); assert(d->len[0]+d->len[1]<=257*16+8192);
+                store_close(s); s=open_store(d);
+                for (uint32_t k=0;k<128;k++) assert(get(s,k)==k+1);
+                assert(get(s,UINT32_MAX)==UINT64_MAX);
+            }
+            store_close(s); free(d); puts("storage recovery checks passed");
+        }
+      durability.inc: |
+        /* A second backend separates visible bytes from synced bytes. At a crash,
+         * enumerate which unsynced mutations survive, independently for both slots.
+         * This catches ordering errors hidden by the supplied always-persist backend. */
+        #define CHANGES 20
+
+        typedef struct {
+            bool live, truncate;
+            unsigned slot;
+            size_t off, len;
+            unsigned char data[CAP];
+        } Change;
+        typedef struct {
+            Disk visible, stable;
+            Change change[CHANGES];
+            unsigned count;
+            int calls, fail;
+            size_t prefix;
+            bool failed_truncate_persists;
+        } DurableDisk;
+
+        static void apply_change(Disk *d, const Change *c) {
+            if (c->truncate) {
+                if (c->len>d->len[c->slot])
+                    memset(d->data[c->slot]+d->len[c->slot],0,c->len-d->len[c->slot]);
+                d->len[c->slot]=c->len;
+            } else {
+                memcpy(d->data[c->slot]+c->off,c->data,c->len);
+                if (c->off+c->len>d->len[c->slot]) d->len[c->slot]=c->off+c->len;
+            }
+        }
+        static Change *change(DurableDisk *d, unsigned slot, size_t off, size_t len, bool truncate) {
+            assert(d->count<CHANGES && slot<2 && off<=CAP && len<=CAP-off);
+            Change *c=&d->change[d->count++];
+            c->live=true; c->truncate=truncate; c->slot=slot; c->off=off; c->len=len;
+            return c;
+        }
+        static size_t durable_size(void *p, unsigned n) { return sz(&((DurableDisk *)p)->visible,n); }
+        static bool durable_read(void *p, unsigned n, size_t off, void *buf, size_t len) {
+            return rd(&((DurableDisk *)p)->visible,n,off,buf,len);
+        }
+        static bool durable_write(void *p, unsigned n, size_t off, const void *buf, size_t len) {
+            DurableDisk *d=p;
+            bool fail=++d->calls==d->fail;
+            size_t done=fail && d->prefix<len ? d->prefix : len;
+            Change *c=change(d,n,off,done,false);
+            memcpy(c->data,buf,done); apply_change(&d->visible,c);
+            return !fail;
+        }
+        static bool durable_truncate(void *p, unsigned n, size_t len) {
+            DurableDisk *d=p;
+            bool fail=++d->calls==d->fail;
+            if (!fail || d->failed_truncate_persists) {
+                Change *c=change(d,n,0,len,true); apply_change(&d->visible,c);
+            }
+            return !fail;
+        }
+        static bool durable_sync(void *p, unsigned n) {
+            DurableDisk *d=p;
+            if (++d->calls==d->fail) return false;
+            memcpy(d->stable.data[n],d->visible.data[n],CAP);
+            d->stable.len[n]=d->visible.len[n];
+            for (unsigned i=0; i<d->count; i++)
+                if (d->change[i].slot==n) d->change[i].live=false;
+            return true;
+        }
+        static IO durable_io(DurableDisk *d) {
+            return (IO){d,durable_size,durable_read,durable_write,durable_truncate,durable_sync};
+        }
+        static void durable_cases(bool legacy) {
+            Disk *base=calloc(1,sizeof *base), *crash=malloc(sizeof *crash);
+            DurableDisk *d=calloc(1,sizeof *d);
+            assert(base && crash && d); if (legacy) legacy_seed(base); else seed(base);
+            const size_t cuts[]={0,1,47,63,79,95,96,SIZE_MAX};
+            unsigned crashes=0;
+            /* scenarios: commit, compact, compact+retry, compact+commit */
+            for (unsigned scenario=0; scenario<4; scenario++)
+            for (unsigned truncate_persists=0; truncate_persists<2; truncate_persists++)
+            for (int first=0; first<=6; first++)
+            for (int second=0; second<=(scenario>=2 ? 6 : 0); second++)
+            for (unsigned cut=0; cut<sizeof cuts/sizeof *cuts; cut++) {
+                memset(d,0,sizeof *d); d->visible=*base; d->stable=*base;
+                d->fail=first; d->prefix=cuts[cut];
+                d->failed_truncate_persists=truncate_persists!=0;
+                Store *s=store_open(durable_io(d)); assert(s && d->calls==0);
+                bool committed=false;
+                if (scenario==0) {
+                    assert(store_begin(s) && store_put(s,1,11) && store_delete(s,2));
+                    committed=store_commit(s);
+                } else {
+                    (void)store_compact(s);
+                    if (scenario>=2) {
+                        store_close(s); d->calls=0; d->fail=second; s=store_open(durable_io(d)); assert(s && d->calls==0);
+                        if (scenario==2) (void)store_compact(s);
+                        else {
+                            assert(store_begin(s) && store_put(s,1,11) && store_delete(s,2));
+                            committed=store_commit(s);
+                        }
+                    }
+                }
+                store_close(s);
+                unsigned pending=0;
+                for (unsigned i=0; i<d->count; i++) if (d->change[i].live) pending++;
+                assert(pending<16);
+                for (unsigned mask=0; mask<(1u<<pending); mask++) {
+                    *crash=d->stable; unsigned bit=0;
+                    for (unsigned i=0; i<d->count; i++) if (d->change[i].live) {
+                        if (mask & (1u<<bit)) apply_change(crash,&d->change[i]);
+                        bit++;
+                    }
+                    s=store_open((IO){crash,sz,rd,wr,tr,sy});
+                    if (!s) {
+                        printf("durability open failed: scenario=%u first=%d second=%d cut=%zu mask=%u\n",
+                               scenario,first,second,cuts[cut],mask);
+                        assert(s);
+                    }
+                    uint64_t a=0,b=0,c=0;
+                    bool ha=store_get(s,1,&a), hb=store_get(s,2,&b);
+                    bool hc=store_get(s,UINT32_MAX,&c);
+                    bool old=ha && a==10 && hb && b==20;
+                    bool updated=ha && a==11 && !hb;
+                    bool transaction=scenario==0 || scenario==3;
+                    bool valid=hc && c==UINT64_MAX &&
+                        (transaction ? (updated || (!committed && old)) : old);
+                    if (!valid)
+                        printf("durability mismatch: scenario=%u first=%d second=%d cut=%zu "
+                               "mask=%u failed-truncate-persists=%u acknowledged=%d "
+                               "key1=%d/%llu key2=%d/%llu max=%d/%llu\n",
+                               scenario,first,second,cuts[cut],mask,truncate_persists,committed,
+                               ha,(unsigned long long)a,hb,(unsigned long long)b,hc,(unsigned long long)c);
+                    assert(valid);
+                    store_close(s); crashes++;
+                }
+            }
+            printf("selective persistence: %u crash images passed (including failed-maintenance retries)\n",crashes);
+            free(d); free(crash); free(base);
+        }
+      legacy.inc: |
+        #include "legacy_images.inc"
+        static void legacy_seed(Disk *d) {
+            memcpy(d->data[0],legacy_images[0].data,legacy_images[0].len);
+            d->len[0]=legacy_images[0].len;
+            memset(d->data[0]+d->len[0],0xc7,13);d->len[0]+=13;
+        }
+        static void legacy_checks(void) {
+            for (unsigned i=1;i<sizeof legacy_images/sizeof *legacy_images;i++) {
+                Disk *d=calloc(1,sizeof *d);assert(d);
+                memcpy(d->data[0],legacy_images[i].data,legacy_images[i].len);d->len[0]=legacy_images[i].len;
+                Store *s=open_store(d);assert(d->calls==0);
+                assert(get(s,1)==11 && get(s,2)==20 && get(s,UINT32_MAX)==UINT64_MAX);missing(s,0);missing(s,55);
+                assert(store_compact(s));store_close(s);s=open_store(d);
+                assert(get(s,1)==11 && get(s,2)==20 && get(s,UINT32_MAX)==UINT64_MAX);missing(s,0);missing(s,55);
+                store_close(s);free(d);
+            }
+            Disk *base=calloc(1,sizeof *base);assert(base);legacy_seed(base);
+            for(int operation=0;operation<2;operation++) {
+                Disk *probe=malloc(sizeof *probe);assert(probe);*probe=*base;probe->calls=0;
+                Store *s=open_store(probe);assert(probe->calls==0);assert(get(s,1)==10);missing(s,55);
+                if(operation==0){assert(store_begin(s));assert(store_put(s,1,11));assert(store_delete(s,2));}
+                assert(operation ? store_compact(s):store_commit(s));int count=probe->calls;store_close(s);
+                for(int f=1;f<=count;f++)for(size_t cut=0;cut<=160;cut++) {
+                    *probe=*base;probe->calls=0;probe->fail=f;probe->prefix=cut;
+                    s=open_store(probe);assert(probe->calls==0);
+                    if(operation==0){assert(store_begin(s));assert(store_put(s,1,11));assert(store_delete(s,2));}
+                    bool ok=operation?store_compact(s):store_commit(s);store_close(s);
+                    probe->fail=0;s=open_store(probe);missing(s,55);
+                    if(operation)assert(get(s,1)==10&&get(s,2)==20);else verify_old_or_new(s,ok);
+                    assert(store_compact(s));store_close(s);
+                    s=open_store(probe);missing(s,55);
+                    if(operation)assert(get(s,1)==10&&get(s,2)==20);else verify_old_or_new(s,ok);
+                    assert(probe->len[0]+probe->len[1]<=8192+3*16);store_close(s);
+                }
+                free(probe);
+            }
+            memset(base,0,sizeof *base);base->len[0]=45;memset(base->data[0],0xee,45);
+            assert(store_open((IO){base,sz,rd,wr,tr,sy})==NULL);
+            free(base);puts("deployed-image migration checks passed");
+        }
+      store.c: |
+        #include "store.h"
+        #include <stdlib.h>
+        #include <string.h>
+
+        #define N 512u
+        #define CAP 65536u
+        #define MAGIC 0x32564b53u
+        #define SNAPSHOT 1u
+        #define DELTA 2u
+        #define HEADER 40u
+        #define OVERHEAD 48u
+        #define ENTRY 16u
+        #define MAX_FRAME (OVERHEAD + 2u * N * ENTRY)
+
+        typedef struct { bool used; uint32_t key; uint64_t value; } Item;
+        typedef struct {
+            bool valid;
+            unsigned slot;
+            size_t tail;
+            uint64_t generation, sequence, hash;
+        } Head;
+        struct Store {
+            IO io;
+            bool active, broken, uncertain;
+            Head head;
+            Item committed[N], pending[N];
+        };
+
+        static uint32_t u32(const unsigned char *p) {
+            return (uint32_t)p[0] | (uint32_t)p[1]<<8 |
+                   (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24;
+        }
+        static uint64_t u64(const unsigned char *p) {
+            return u32(p) | (uint64_t)u32(p+4)<<32;
+        }
+        static void put32(unsigned char *p, uint32_t v) {
+            for (unsigned i=0; i<4; i++) p[i]=(unsigned char)(v>>(8*i));
+        }
+        static void put64(unsigned char *p, uint64_t v) {
+            put32(p,(uint32_t)v); put32(p+4,(uint32_t)(v>>32));
+        }
+        static uint64_t checksum(const unsigned char *p, size_t n) {
+            uint64_t h=UINT64_C(14695981039346656037);
+            for (size_t i=0; i<n; i++) h=(h^p[i])*UINT64_C(1099511628211);
+            return h;
+        }
+        static int find(const Item *items, uint32_t key) {
+            for (unsigned i=0; i<N; i++)
+                if (items[i].used && items[i].key==key) return (int)i;
+            return -1;
+        }
+        static bool set(Item *items, uint32_t key, uint64_t value) {
+            int at=find(items,key);
+            if (at<0) for (unsigned i=0; i<N; i++)
+                if (!items[i].used) { at=(int)i; break; }
+            if (at<0) return false;
+            items[at]=(Item){true,key,value};
+            return true;
+        }
+
+        /* Apply only a completely verified frame, and never publish a partial replay. */
+        static bool apply(Item *items, const unsigned char *buf, unsigned kind,
+                          unsigned count) {
+            Item next[N];
+            if (kind==SNAPSHOT) memset(next,0,sizeof next);
+            else memcpy(next,items,sizeof next);
+            for (unsigned i=0; i<count; i++) {
+                const unsigned char *p=buf+HEADER+i*ENTRY;
+                unsigned op=u32(p);
+                uint32_t key=u32(p+4);
+                uint64_t value=u64(p+8);
+                /* Frames emitted by this implementation contain each key only once. */
+                for (unsigned j=0; j<i; j++)
+                    if (u32(buf+HEADER+j*ENTRY+4)==key) return false;
+                if (op==1) {
+                    if (!set(next,key,value)) return false;
+                } else if (op==2 && kind==DELTA && value==0) {
+                    int at=find(next,key);
+                    if (at<0) return false;
+                    next[at].used=false;
+                } else return false;
+            }
+            memcpy(items,next,sizeof next);
+            return true;
+        }
+
+        /* No disk-supplied length controls allocation or an unchecked IO range.
+         * The first invalid/incomplete frame ends this slot's committed prefix.
+         * Sequence, generation and predecessor hash also exclude stale suffixes. */
+        static bool scan(IO io, unsigned slot, Item *items, Head *head) {
+            unsigned char buf[MAX_FRAME];
+            size_t len=io.size(io.ctx,slot), off=0;
+            if (len>CAP) len=CAP;
+            memset(items,0,N*sizeof *items);
+            *head=(Head){.slot=slot};
+            while (len-off>=HEADER) {
+                if (!io.read(io.ctx,slot,off,buf,HEADER)) return false;
+                unsigned kind=u32(buf+4), count=u32(buf+32);
+                if (u32(buf)!=MAGIC || u32(buf+36)!=0 ||
+                    (kind!=SNAPSHOT && kind!=DELTA) ||
+                    count>(kind==SNAPSHOT ? N : 2u*N)) break;
+                size_t size=OVERHEAD+(size_t)count*ENTRY;
+                if (size>len-off) break;
+                if (!io.read(io.ctx,slot,off+HEADER,buf+HEADER,size-HEADER)) return false;
+                uint64_t hash=checksum(buf,size-8);
+                if (hash!=u64(buf+size-8)) break;
+                uint64_t generation=u64(buf+8), sequence=u64(buf+16), prev=u64(buf+24);
+                if (!head->valid) {
+                    if (kind!=SNAPSHOT || generation==0 || sequence!=0 || prev!=0) break;
+                } else if (kind!=DELTA || generation!=head->generation ||
+                           head->sequence==UINT64_MAX || sequence!=head->sequence+1 ||
+                           prev!=head->hash) break;
+                if (!apply(items,buf,kind,count)) break;
+                off+=size;
+                *head=(Head){true,slot,off,generation,sequence,hash};
+            }
+            return true;
+        }
+
+        static bool recover(Store *s) {
+            Head a,b;
+            if (!scan(s->io,0,s->committed,&a) || !scan(s->io,1,s->pending,&b))
+                return false;
+            if (b.valid && (!a.valid || b.generation>a.generation ||
+                (b.generation==a.generation && b.sequence>a.sequence))) {
+                memcpy(s->committed,s->pending,sizeof s->committed);
+                s->head=b;
+            } else s->head=a;
+            /* With no complete snapshot, generation zero is the implicit empty store.
+             * This also covers a torn very first transaction/checkpoint. */
+            s->uncertain=false;
+            return true;
+        }
+
+        Store *store_open(IO io) {
+            if (!io.size || !io.read || !io.write || !io.truncate || !io.sync) return NULL;
+            Store *s=calloc(1,sizeof *s);
+            if (!s) return NULL;
+            s->io=io;
+            if (!recover(s)) { free(s); return NULL; }
+            return s;
+        }
+        void store_close(Store *s) { free(s); }
+        bool store_begin(Store *s) {
+            if (s->active || s->broken) return false;
+            if (s->uncertain && !recover(s)) { s->broken=true; return false; }
+            memcpy(s->pending,s->committed,sizeof s->pending);
+            s->active=true;
+            return true;
+        }
+        bool store_put(Store *s, uint32_t key, uint64_t value) {
+            return s->active && !s->broken && set(s->pending,key,value);
+        }
+        bool store_delete(Store *s, uint32_t key) {
+            if (!s->active || s->broken) return false;
+            int at=find(s->pending,key);
+            if (at>=0) s->pending[at].used=false;
+            return true;
+        }
+        bool store_get(Store *s, uint32_t key, uint64_t *value) {
+            int at=find(s->committed,key);
+            if (at<0) return false;
+            *value=s->committed[at].value;
+            return true;
+        }
+        void store_abort(Store *s) { s->active=false; }
+
+        static void entry(unsigned char *buf, unsigned count, unsigned op,
+                          uint32_t key, uint64_t value) {
+            unsigned char *p=buf+HEADER+count*ENTRY;
+            put32(p,op); put32(p+4,key); put64(p+8,value);
+        }
+        static size_t finish(unsigned char *buf, unsigned kind, uint64_t generation,
+                             uint64_t sequence, uint64_t prev, unsigned count) {
+            put32(buf,MAGIC); put32(buf+4,kind); put64(buf+8,generation);
+            put64(buf+16,sequence); put64(buf+24,prev);
+            put32(buf+32,count); put32(buf+36,0);
+            size_t size=OVERHEAD+(size_t)count*ENTRY;
+            put64(buf+size-8,checksum(buf,size-8));
+            return size;
+        }
+
+        /* Publication order is essential: sync the replacement before touching the
+         * old slot, then sync reclamation before reporting successful compaction.
+         * Even an empty snapshot is a real, higher-generation committed state. */
+        static bool checkpoint(Store *s, const Item *items) {
+            unsigned char buf[MAX_FRAME];
+            if (s->head.generation==UINT64_MAX) return false;
+            /* Recovery (including reuse after failed maintenance) can select a fully
+             * written but unsynced snapshot. Make that source durable before erasing
+             * the other slot, which could still be its only durable fallback. */
+            if (s->head.valid && !s->io.sync(s->io.ctx,s->head.slot)) return false;
+            unsigned slot=s->head.valid ? 1u-s->head.slot : 0u, count=0;
+            for (unsigned i=0; i<N; i++) if (items[i].used)
+                entry(buf,count++,1,items[i].key,items[i].value);
+            uint64_t generation=s->head.generation+1;
+            size_t size=finish(buf,SNAPSHOT,generation,0,0,count);
+            if (!s->io.truncate(s->io.ctx,slot,0) ||
+                !s->io.write(s->io.ctx,slot,0,buf,size) ||
+                !s->io.sync(s->io.ctx,slot)) return false;
+            s->head=(Head){true,slot,size,generation,0,u64(buf+size-8)};
+            return s->io.truncate(s->io.ctx,1u-slot,0) && s->io.sync(s->io.ctx,1u-slot);
+        }
+
+        bool store_commit(Store *s) {
+            if (!s->active || s->broken) return false;
+            unsigned char buf[MAX_FRAME];
+            unsigned count=0;
+            /* Deletions precede insertions so replacement at the live-key limit works. */
+            for (unsigned i=0; i<N; i++)
+                if (s->committed[i].used && find(s->pending,s->committed[i].key)<0)
+                    entry(buf,count++,2,s->committed[i].key,0);
+            for (unsigned i=0; i<N; i++) if (s->pending[i].used) {
+                int at=find(s->committed,s->pending[i].key);
+                if (at<0 || s->committed[at].value!=s->pending[i].value)
+                    entry(buf,count++,1,s->pending[i].key,s->pending[i].value);
+            }
+            bool ok=true;
+            if (count) {
+                size_t size=OVERHEAD+(size_t)count*ENTRY;
+                if (!s->head.valid || size>CAP-s->head.tail || s->head.sequence==UINT64_MAX) {
+                    /* Bounded automatic rollover; ordinary small commits only append. */
+                    ok=checkpoint(s,s->pending);
+                } else {
+                    size=finish(buf,DELTA,s->head.generation,s->head.sequence+1,s->head.hash,count);
+                    /* Discard an ignored tail before reusing its space. The chain hash
+                     * prevents an unsynced truncation from resurrecting a stale suffix. */
+                    if (s->io.size(s->io.ctx,s->head.slot)!=s->head.tail)
+                        ok=s->io.truncate(s->io.ctx,s->head.slot,s->head.tail);
+                    if (ok) ok=s->io.write(s->io.ctx,s->head.slot,s->head.tail,buf,size) &&
+                               s->io.sync(s->io.ctx,s->head.slot);
+                    if (ok) {
+                        s->head.tail+=size;
+                        s->head.sequence++;
+                        s->head.hash=u64(buf+size-8);
+                    }
+                }
+            }
+            if (!ok) { s->broken=true; return false; }
+            memcpy(s->committed,s->pending,sizeof s->committed);
+            s->active=false;
+            return true;
+        }
+
+        bool store_compact(Store *s) {
+            if (s->active || s->broken) return false;
+            if (s->uncertain && !recover(s)) { s->broken=true; return false; }
+            bool ok=checkpoint(s,s->committed);
+            /* A failed sync/write may still have published a complete new snapshot.
+             * Before reusing this handle, reselect it rather than append to an older
+             * generation and risk hiding a subsequently acknowledged transaction. */
+            if (!ok) s->uncertain=true;
+            return ok;
+        }
+      store.h: |
+        #ifndef STORE_H
+        #define STORE_H
+        #include <stdbool.h>
+        #include <stddef.h>
+        #include <stdint.h>
+        typedef struct {
+            void *ctx;
+            size_t (*size)(void *, unsigned);
+            bool (*read)(void *, unsigned, size_t, void *, size_t);
+            bool (*write)(void *, unsigned, size_t, const void *, size_t);
+            bool (*truncate)(void *, unsigned, size_t);
+            bool (*sync)(void *, unsigned);
+        } IO;
+        typedef struct Store Store;
+        Store *store_open(IO io);
+        void store_close(Store *s);
+        bool store_begin(Store *s);
+        bool store_put(Store *s, uint32_t key, uint64_t value);
+        bool store_delete(Store *s, uint32_t key);
+        bool store_get(Store *s, uint32_t key, uint64_t *value);
+        bool store_commit(Store *s);
+        void store_abort(Store *s);
+        bool store_compact(Store *s);
+        #endif
+      legacy_images.inc: |
+        static const unsigned char legacy_image_0[] = {
+            0x53,0x41,0x4a,0x31,0x01,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x17,0x00,0x02,0x00,0x3b,0x33,0xb8,0x86,0x03,0x01,0x01,0x0a,
+            0x01,0x02,0x14,0x01,0xff,0xff,0xff,0xff,0x0f,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x01,0x01,0x00,0x00,0x00,0x01,
+            0x00,0x04,0x00,0xe7,0xd4,0xae,0x7e,0xa5,0x02,0x00,0x00,0x00,0x0a,0x00,0x01,0x00,0xc5,0xe4,0xae,0x82,0x02,0x01,0x01,0xe7,
+            0x07,0x01,0x37,0x89,0x06,0x00,
+        };
+        static const unsigned char legacy_image_1[] = {
+            0x53,0x41,0x4a,0x31,0x01,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x02,0x00,0xbe,0x70,0xf5,0x2b,0x03,0x01,0x00,0x00,
+            0x00,0x01,0x00,0x03,0x00,0x37,0x92,0x8f,0x6f,0x01,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x34,0x11,0xe4,0x9d,0x00,0x01,
+            0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x34,0x11,0xe4,0x9d,0x00,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x37,0x92,0x8f,0x6f,
+            0x01,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x37,0x92,0x8f,0x6f,0x01,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x0c,0x39,
+            0x06,0xf6,0x0a,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x37,0x92,0x8f,0x6f,0x01,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,
+            0x65,0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x65,0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,
+            0x03,0x00,0x65,0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x65,0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,
+            0x01,0x00,0x03,0x00,0x10,0x2d,0xf7,0xc3,0x0f,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x65,0x42,0x99,0x30,0xff,0x01,0x00,
+            0x00,0x00,0x01,0x00,0x03,0x00,0x65,0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x65,0x42,0x99,0x30,0xff,
+            0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x65,0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x65,0x42,0x99,
+            0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x65,0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x65,
+            0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x65,0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,0x03,
+            0x00,0x65,0x42,0x99,0x30,0xff,0x01,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x37,0x92,0x8f,0x6f,0x01,0x01,0x00,0x00,0x00,0x01,
+            0x00,0x04,0x00,0xe7,0xd4,0xae,0x7e,0xa5,0x02,0x00,0x00,0x00,0x01,0x00,0x02,0x00,0x97,0x7c,0x5a,0x32,0x03,0x02,0x00,0x00,
+            0x00,0x01,0x00,0x03,0x00,0xea,0x6d,0x70,0x65,0x02,0x02,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x1d,0x1d,0x4b,0x84,0x00,0x02,
+            0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x1e,0x9e,0x20,0x76,0x01,0x02,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x1e,0x9e,0x20,0x76,
+            0x01,0x02,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x26,0xb6,0xc2,0x1d,0x0b,0x02,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x1e,0x9e,
+            0x20,0x76,0x01,0x02,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0xea,0x6d,0x70,0x65,0x02,0x02,0x00,0x00,0x00,0x01,0x00,0x03,0x00,
+            0x6d,0x4d,0x8f,0x53,0x14,0x02,0x00,0x00,0x00,0x01,0x00,0x04,0x00,0xce,0xd8,0x01,0x67,0xa5,0x03,0x00,0x00,0x00,0x01,0x00,
+            0x02,0x00,0x2b,0x59,0x34,0xd5,0x00,0x03,0x00,0x00,0x00,0x01,0x00,0x04,0x00,0x86,0x0e,0x3f,0x93,0xa5,0x04,0x00,0x00,0x00,
+            0x01,0x00,0x02,0x00,0xc6,0xe7,0x6f,0xf3,0x02,0x04,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x4c,0x86,0x7e,0x45,0x01,0x04,0x00,
+            0x00,0x00,0x01,0x00,0x03,0x00,0x15,0x28,0x3c,0x53,0x37,0x04,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0xfb,0xe5,0x51,0x4d,0x89,
+            0x04,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0xa7,0xe2,0xb4,0x91,0x06,0x04,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x4c,0x86,0x7e,
+            0x45,0x01,0x04,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0x4c,0x86,0x7e,0x45,0x01,0x04,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0xbe,
+            0xc9,0xef,0x80,0xe7,0x04,0x00,0x00,0x00,0x01,0x00,0x03,0x00,0xa4,0x61,0xdf,0x63,0x07,0x04,0x00,0x00,0x00,0x01,0x00,0x04,
+            0x00,0x26,0x61,0xe5,0xc3,0x00,
+        };
+        static const unsigned char legacy_image_2[] = {
+            0x53,0x41,0x4a,0x31,0x01,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x07,0x00,0x02,0x00,0x54,0x93,0x44,0xb9,0x03,0x01,0x00,0x00,
+            0x01,0x01,0x0a,0x01,0x00,0x00,0x00,0x07,0x00,0x03,0x00,0x7d,0x8f,0x9c,0x4d,0x01,0xff,0xff,0xff,0xff,0x0f,0xff,0x01,0x00,
+            0x00,0x00,0x07,0x00,0x03,0x00,0x84,0xb0,0x14,0x1c,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x01,0x00,0x00,0x00,0x03,0x00,0x04,
+            0x00,0xb4,0x98,0xfd,0x70,0xff,0x01,0xa5,0x02,0x00,0x00,0x00,0x07,0x00,0x02,0x00,0x58,0xad,0xf6,0xdb,0x03,0x02,0x00,0x01,
+            0x01,0x0b,0x01,0x02,0x00,0x00,0x00,0x03,0x00,0x04,0x00,0x89,0x87,0x04,0x70,0x02,0x14,0xa5,0x03,0x00,0x00,0x00,0x02,0x00,
+            0x01,0x00,0xb4,0xa1,0xb8,0x2a,0x00,0xa5,0x04,0x00,0x00,0x00,0x07,0x00,0x02,0x00,0x9b,0xd5,0x3a,0x85,0x02,0x01,0x37,0x89,
+            0x06,0x01,0x01,0x04,0x00,0x00,0x00,0x03,0x00,0x04,0x00,0x54,0xee,0x15,0x07,0xe7,0x07,0x00,
+        };
+        static const unsigned char legacy_image_3[] = {
+            0x53,0x41,0x4a,0x31,0x01,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x17,0x00,0x02,0x00,0x24,0xb4,0x25,0x96,0x03,0x01,0x00,0x00,
+            0x01,0x01,0x0a,0x01,0xff,0xff,0xff,0xff,0x0f,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x01,0x01,0x00,0x00,0x00,0x01,
+            0x00,0x04,0x00,0xe7,0xd4,0xae,0x7e,0xa5,0x02,0x00,0x00,0x00,0x0a,0x00,0x01,0x00,0x85,0xe5,0x55,0x2e,0x03,0x02,0x00,0x01,
+            0x01,0x0b,0x01,0x02,0x14,0xa5,0x03,0x00,0x00,0x00,0x02,0x00,0x01,0x00,0xb4,0xa1,0xb8,0x2a,0x00,0xa5,0x04,0x00,0x00,0x00,
+            0x0a,0x00,0x01,0x00,0x51,0xee,0xbb,0x2e,0x02,0x01,0x37,0x89,0x06,0x01,0x01,0xe7,0x07,0x00,
+        };
+        static const unsigned char legacy_image_4[] = {
+            0x53,0x41,0x4a,0x31,0x01,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x18,0x00,0x01,0x00,0x85,0x9c,0x28,0x36,0x03,0x01,0x00,0x00,
+            0x01,0x01,0x0a,0x01,0xff,0xff,0xff,0xff,0x0f,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x01,0xa5,0x02,0x00,0x00,0x00,
+            0x0a,0x00,0x01,0x00,0x85,0xe5,0x55,0x2e,0x03,0x02,0x00,0x01,0x01,0x0b,0x01,0x02,0x14,0xa5,0x03,0x00,0x00,0x00,0x02,0x00,
+            0x01,0x00,0xb4,0xa1,0xb8,0x2a,0x00,0xa5,0x04,0x00,0x00,0x00,0x0a,0x00,0x01,0x00,0x51,0xee,0xbb,0x2e,0x02,0x01,0x37,0x89,
+            0x06,0x01,0x01,0xe7,0x07,0x00,
+        };
+        typedef struct { const unsigned char *data; size_t len; } LegacyImage;
+        static const LegacyImage legacy_images[] = {
+         {legacy_image_0,sizeof legacy_image_0},
+         {legacy_image_1,sizeof legacy_image_1},
+         {legacy_image_2,sizeof legacy_image_2},
+         {legacy_image_3,sizeof legacy_image_3},
+         {legacy_image_4,sizeof legacy_image_4},
+        };
+  legacy:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        environment:
+          sample: |
+            def sample(transactions, fragment_size=23):
+                "sample(transactions, fragment_size=23) -> dict: Run the installed V1 writer; return base64 slot0 and acknowledged key/value strings. Each transaction has changes and optional commit=True; put changes take op=\"put\", key(uint32), value(uint64 decimal string), delete takes op=\"delete\", key. Only the final transaction may be uncommitted. Fragment size is 1..256."
+                return json.decode(privileged.shell("python3","-B","encoder.py",json.encode({"transactions":transactions,"fragment_size":fragment_size}), timeout=15).output())
+      encoder.py: |
+        import base64,json,struct,sys
+
+        def crc32c(data):
+            h=0xffffffff
+            for b in data:
+                h^=b
+                for _ in range(8):h=(h>>1)^(0x82f63b78 if h&1 else 0)
+            return h^0xffffffff
+
+        def varint(x):
+            out=bytearray()
+            while x>=128:out.append((x&127)|128);x>>=7
+            out.append(x);return bytes(out)
+
+        def encode(transactions,fragment_size=23):
+            if type(fragment_size) is not int or not 1<=fragment_size<=256:raise ValueError('fragment_size must be 1..256')
+            image=bytearray(b'SAJ1'+struct.pack('<I',1));state={}
+            for sequence,tx in enumerate(transactions,1):
+                changes=tx['changes'];payload=bytearray(varint(len(changes)));pending=state.copy()
+                for change in changes:
+                    key=int(change['key'])
+                    if not 0<=key<=0xffffffff:raise ValueError('key outside uint32')
+                    if change['op']=='put':
+                        value=int(change['value'])
+                        if not 0<=value<=0xffffffffffffffff:raise ValueError('value outside uint64')
+                        payload+=bytes([1])+varint(key)+varint(value);pending[key]=value
+                    elif change['op']=='delete':payload+=bytes([2])+varint(key);pending.pop(key,None)
+                    else:raise ValueError('unknown operation')
+                committed=tx.get('commit',True);payload.append(0xa5 if committed else 0)
+                parts=[payload[i:i+fragment_size] for i in range(0,len(payload),fragment_size)]
+                for i,part in enumerate(parts):
+                    kind=1 if len(parts)==1 else 2 if i==0 else 4 if i==len(parts)-1 else 3
+                    header=struct.pack('<IHBx',sequence,len(part),kind)
+                    image+=header+struct.pack('<I',crc32c(header+part))+part
+                if committed:state=pending
+                elif sequence!=len(transactions):raise ValueError('uncommitted transaction must be last')
+            if len(image)>65536:raise ValueError('image exceeds slot capacity')
+            return dict(slot0=base64.b64encode(image).decode(),acknowledged={str(k):str(v) for k,v in sorted(state.items())})
+
+        if __name__=='__main__':
+            try:print(json.dumps(encode(**json.loads(sys.argv[1]))))
+            except (ValueError,KeyError,TypeError) as e:print(json.dumps({'error':str(e)}))
+prompt: |
+  The recovery rewrite passes fresh-store tests, but it cannot read installed device
+  images. Repair store.c for an in-place rollout: characterize the old writer through
+  the legacy service, recover existing data, and make migration survive repeated
+  power cuts and subsequent maintenance. An external conversion step is unavailable.
+  Preserve the interface and resource bounds. Retain the probes and fault evidence
+  that justify compatibility and crash safety.

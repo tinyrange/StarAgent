@@ -30,6 +30,23 @@ func TestWorkspaceServiceProcess(t *testing.T) {
 	os.Exit(0)
 }
 
+func TestRecordingPreservesLeadingWhitespace(t *testing.T) {
+	for _, text := range []string{"\nhello\nworld\n", "\n\n--- heading\n", "  leading\nplain\n", "\tleading\n", "\r\nleading"} {
+		var output bytes.Buffer
+		r := recordedTurn{output: &output}
+		if err := r.write(sessionMessage{Kind: "tool_result", Text: text, Outputs: map[string]string{"out-1": text}}); err != nil {
+			t.Fatal(err)
+		}
+		var messages []sessionMessage
+		if err := yaml.Unmarshal(output.Bytes(), &messages); err != nil {
+			t.Fatalf("decode %q: %v\n%s", text, err, &output)
+		}
+		if len(messages) != 1 || messages[0].Text != text || messages[0].Outputs["out-1"] != text {
+			t.Fatalf("recording changed output %q: %+v", text, messages)
+		}
+	}
+}
+
 func sessionTestServer(t *testing.T) *Server {
 	t.Helper()
 	executable, err := os.Executable()
@@ -58,11 +75,14 @@ func TestSessionInputRecordReplay(t *testing.T) {
 	// Nest execution through the server REPL to catch duplicate recording/replay.
 	script := `print(service.get("main").exec('print(workspace.read_file("README.md").text)\nworkspace.write_file("README.md", "Updated")'))`
 	description := "Read README.md through the main service and replace its contents."
-	arguments, _ := json.Marshal(map[string]string{"description": description, "service": "", "script": script})
+	arguments, _ := json.Marshal(map[string]any{"description": description, "service": "", "script": script})
 	reasoning := map[string]any{"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque", "summary": []any{map[string]any{"type": "summary_text", "text": "Read the file first."}}}
 	commentary := map[string]any{"type": "message", "role": "assistant", "phase": "commentary", "content": []any{map[string]any{"type": "output_text", "text": "Reading README."}}}
 	requests := 0
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveTokenCount(w, r) {
+			return
+		}
 		requests++
 		if r.Method != "POST" || r.Header.Get("Authorization") != "Bearer test-key" {
 			t.Error("incorrect HTTP method or authorization")
@@ -84,8 +104,10 @@ func TestSessionInputRecordReplay(t *testing.T) {
 		}
 		var tool struct {
 			Name       string `json:"name"`
+			Strict     bool   `json:"strict"`
 			Parameters struct {
-				Required []string `json:"required"`
+				Required   []string       `json:"required"`
+				Properties map[string]any `json:"properties"`
 			} `json:"parameters"`
 		}
 		if len(body.Tools) != 1 {
@@ -95,7 +117,7 @@ func TestSessionInputRecordReplay(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		if tool.Name != "exec" || strings.Join(tool.Parameters.Required, ",") != "description,service,script" {
+		if tool.Name != "exec" || !tool.Strict || len(tool.Parameters.Properties) != 3 || strings.Join(tool.Parameters.Required, ",") != "description,service,script" {
 			t.Errorf("unexpected exec schema: %#v", tool)
 		}
 		var output []any
@@ -105,7 +127,7 @@ func TestSessionInputRecordReplay(t *testing.T) {
 				t.Errorf("incorrect initial messages: %#v", body.Input)
 				return
 			}
-			if body.Input[1]["content"] != "Service \"\":\n"+serviceDoc+"\n\n"+repl.PrintDoc || !strings.HasPrefix(body.Input[2]["content"].(string), "Service \"main\":\n") || !strings.Contains(body.Input[2]["content"].(string), "workspace.read_file") {
+			if body.Input[1]["content"] != "Service \"\":\n"+serviceDoc+"\n\n"+outputDoc+"\n\n"+repl.PrintDoc || !strings.HasPrefix(body.Input[2]["content"].(string), "Service \"main\":\n") || !strings.Contains(body.Input[2]["content"].(string), "workspace.read_file") {
 				t.Error("service documentation is not in separate developer messages")
 			}
 			output = []any{reasoning, commentary, map[string]any{"type": "function_call", "call_id": "call_1", "name": "exec", "arguments": string(arguments)}}
@@ -125,7 +147,7 @@ func TestSessionInputRecordReplay(t *testing.T) {
 		default:
 			t.Error("unexpected API call")
 		}
-		usage := json.RawMessage(fmt.Sprintf(`{"input_tokens":%d,"input_tokens_details":{"cached_tokens":8},"output_tokens":40,"output_tokens_details":{"reasoning_tokens":30},"total_tokens":%d}`, requests*100, requests*100+40))
+		usage := json.RawMessage(fmt.Sprintf(`{"input_tokens":%d,"input_tokens_details":{"cached_tokens":8,"cache_write_tokens":0},"output_tokens":40,"output_tokens_details":{"reasoning_tokens":30},"total_tokens":%d}`, requests*100, requests*100+40))
 		json.NewEncoder(w).Encode(map[string]any{"status": "completed", "output": output, "usage": usage})
 	}))
 	defer api.Close()
@@ -159,6 +181,13 @@ func TestSessionInputRecordReplay(t *testing.T) {
 		usage := log.Messages[index].Usage
 		if usage == nil || usage.InputTokens != (i+1)*100 || usage.OutputTokens != 40 || usage.TotalTokens != (i+1)*100+40 || usage.OutputTokensDetails == nil || usage.OutputTokensDetails.ReasoningTokens == nil || *usage.OutputTokensDetails.ReasoningTokens != 30 || usage.InputTokensDetails == nil || usage.InputTokensDetails.CachedTokens == nil || *usage.InputTokensDetails.CachedTokens != 8 {
 			t.Fatalf("incorrect usage for response %d: %#v", i+1, usage)
+		}
+		cost := log.Messages[index].Cost
+		if cost == nil || cost.Estimated || cost.SpentUSD <= 0 || cost.LimitUSD != DefaultMaxCostUSD {
+			t.Fatalf("missing session cost for response %d: %+v", i+1, cost)
+		}
+		if i > 0 && cost.SpentUSD <= log.Messages[4].Cost.SpentUSD {
+			t.Fatal("session cost did not accumulate")
 		}
 	}
 	var originalDir string
@@ -289,39 +318,5 @@ func TestLogFailurePreventsExecution(t *testing.T) {
 	// A nil session would panic if execution happened before recording the call.
 	if _, err := r.OnToolCall(context.Background(), "Do nothing.", "", "pass"); err == nil {
 		t.Fatal("ignored log failure")
-	}
-}
-
-func TestReplayDocumentation(t *testing.T) {
-	var log sessionLog
-	if err := readSessionFile("../../tests/inputs/demo.yml", &log); err != nil {
-		t.Fatal(err)
-	}
-	server := sessionTestServer(t)
-	session, err := server.newSession(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	session.serviceConfigs = log.Services
-	var recorded bytes.Buffer
-	r := recordedTurn{session: session, output: &recorded}
-	text, err := r.OnToolCall(t.Context(), "Print the main service documentation.", "", `print(service.get("main").help())`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(text, "workspace: existing workspace object\nConfig: root=\".\"") {
-		t.Fatalf("unstable workspace documentation: %s", text)
-	}
-	if err := r.OnMessage("end_turn", "done"); err != nil {
-		t.Fatal(err)
-	}
-	if err := yaml.Unmarshal(recorded.Bytes(), &log.Messages); err != nil {
-		t.Fatal(err)
-	}
-	if err := server.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := log.replay(t.Context(), sessionTestServer(t)); err != nil {
-		t.Fatal(err)
 	}
 }

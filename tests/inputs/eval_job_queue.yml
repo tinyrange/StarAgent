@@ -1,0 +1,286 @@
+# Evaluation revision 2. Paid recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+  max_cost_usd: 1.0
+developer: "Preserve the documented interfaces. Work within the supplied workspaces and service APIs. Use installed toolchains and standard libraries. Report what you changed, the evidence you obtained, and any remaining limitations."
+services:
+  worker:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "SPEC.txt", "check.js", "schedules.js", "package.json", "advanced.js"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Run the worker schedule suite and report aggregate failures."
+                return privileged.shell("node", "check.js", timeout=30).run()
+          node: |
+            def node(path, *args):
+                "node(path, *args) -> result: Run a JavaScript entrypoint from the workspace."
+                return privileged.shell("node", path, timeout=30, *args).run()
+      SPEC.txt: |
+        Pool(limit, start) is a deterministic job dispatcher. start(id, attempt) begins
+        an asynchronous operation and returns a handle with cancel(). The operation
+        later calls pool.complete(id, attempt, outcome), where outcome is "ok" or "retry".
+        A cancelled attempt can still complete. There is no guarantee on completion order.
+        submit(id) is idempotent while that ID is queued/running; resubmission after a
+        terminal state starts a new generation of that logical ID. Attempts are opaque
+        positive integers and must never be reused during a Pool's lifetime, even when
+        an ID is reused. Calls for unknown/stale attempts are harmless.
+
+        At most limit attempts may occupy slots. Cancellation asks the handle to cancel
+        but DOES NOT free its slot until that same attempt completes. A job cancelled
+        before dispatch never starts. A running job's cancellation is terminal for that
+        generation; any eventual "retry" completion must not resurrect it. A resubmitted
+        ID may be queued while its earlier cancelled generation is still occupying a slot.
+        Retry releases the old slot, then places a new attempt at the END of the FIFO
+        queue. Duplicate completions must not release slots or finish a newer attempt.
+
+        start and handle.cancel may synchronously call any Pool method, including
+        complete/submit/cancel. State must already be consistent when callbacks run.
+        The pool must make progress whenever a slot is available, without recursion
+        proportional to job count. A synchronous start exception acts like "retry";
+        assume each job eventually has a start attempt that does not throw.
+
+        snapshot() returns {queued:[IDs in FIFO order], running:[{id,attempt}],
+                           finished:[IDs whose latest generation completed successfully]}.
+        The returned arrays/objects must be independent of internal state. Running
+        includes cancelled attempts until their actual completion. IDs are arbitrary
+        nonempty strings, including "__proto__". limit is a positive integer.
+
+        check() reports aggregate schedule results. node(path,*args) runs a workspace
+        JavaScript entrypoint and returns stdout/stderr/exit status.
+        The dispatcher now also supports submit(id, tenant="default", weight=1) and
+        configure(capacity, tenantLimits={}). The constructor limit and configure capacity
+        are positive integers measuring total running weight, not number of attempts.
+        Weights are positive integers. tenantLimits maps tenant names to nonnegative
+        running-weight caps; omitted tenants have the global capacity. Changing caps
+        never cancels or releases an existing attempt. A shrink may leave running weight
+        over a cap; new dispatch is allowed only if that new attempt fits both caps.
+        An oversized or zero-cap tenant's queued jobs wait for a later configuration.
+
+        Dispatch uses the oldest eligible job: scan FIFO and skip jobs that cannot fit.
+        A skipped job retains its relative position. Retry keeps its tenant and weight
+        and rejoins the tail. Cancellation retains both global and tenant leases until
+        completion. ID reuse can change tenant and weight. Duplicate submit must not
+        change an active generation's attributes. Inputs are validated before any state
+        change; configure copies its argument. Prototype-like IDs and tenant names work.
+        Unknown outcome values throw RangeError without releasing the attempt.
+
+        If start cancels its own job before returning a handle, invoke that handle's
+        cancel exactly once after return if the attempt is still live. A cancel handle
+        may throw: suppress that exception but retain its lease until completion. If
+        start completes its attempt synchronously and then throws, the completion wins.
+        configure, submit, cancel and complete may all be called reentrantly from either
+        callback. snapshot retains its existing schema and returns deep independent data.
+      check.js: |
+        import {Pool} from './pool.js';
+        import {exercise,contracts} from './schedules.js';
+        import {weighted,nested,validation} from './advanced.js';
+        let failed=0,total=0;
+        const run=f=>{total++;try{f();}catch{failed++;}};
+        for(let s=1;s<=96;s++)run(()=>exercise(Pool,s));run(()=>contracts(Pool));
+        for(let s=1;s<=160;s++)run(()=>weighted(Pool,s*104729));run(()=>nested(Pool));run(()=>validation(Pool));
+        console.log(JSON.stringify({schedules:total,failed}));process.exitCode=failed?1:0;
+      package.json: |
+        {"private":true,"type":"module"}
+      pool.js: |
+        export class Pool {
+          constructor(limit, start) {
+            if (!Number.isInteger(limit) || limit < 1) throw new RangeError('limit');
+            this.limit = limit;
+            this.start = start;
+            this.queue = [];
+            this.jobs = new Map();
+            this.running = new Map();
+            this.finished = new Set();
+            this.attempt = 0;
+            this.pumping = false;
+          }
+          submit(id) {
+            if (this.jobs.has(id)) return;
+            this.finished.delete(id);
+            const job = {id, cancelled: false};
+            this.jobs.set(id, job);
+            this.queue.push(job);
+            this.pump();
+          }
+          cancel(id) {
+            const job = this.jobs.get(id);
+            if (!job) return;
+            job.cancelled = true;
+            this.jobs.delete(id);
+            this.queue = this.queue.filter(j => j !== job);
+            const active = [...this.running.values()].find(r => r.job === job);
+            // Cancellation is terminal for the job, but only completion frees its slot.
+            if (active) active.handle?.cancel();
+            this.pump();
+          }
+          complete(id, attempt, outcome) {
+            const active = this.running.get(attempt);
+            if (!active || active.job.id !== id) return;
+            this.running.delete(attempt);
+            // An older cancelled generation must not affect a resubmitted ID.
+            if (!active.job.cancelled && this.jobs.get(id) === active.job) {
+              if (outcome === 'retry') {
+                this.queue.push(active.job);
+              } else {
+                this.jobs.delete(id);
+                this.finished.add(id);
+              }
+            }
+            this.pump();
+          }
+          pump() {
+            // Reentrant calls change state; this loop drains it without growing the stack.
+            if (this.pumping) return;
+            this.pumping = true;
+            try {
+              while (this.running.size < this.limit && this.queue.length) {
+                const job = this.queue.shift();
+                if (job.cancelled) continue;
+                const attempt = ++this.attempt;
+                const active = {job, attempt, handle: null};
+                // Publish the reservation before start can call back into the pool.
+                this.running.set(attempt, active);
+                try {
+                  active.handle = this.start(job.id, attempt);
+                } catch {
+                  this.complete(job.id, attempt, 'retry');
+                  continue;
+                }
+                // cancel() may have run before start returned its handle.
+                if (job.cancelled && this.running.get(attempt) === active) {
+                  active.handle?.cancel();
+                }
+              }
+            } finally {
+              this.pumping = false;
+            }
+          }
+          snapshot() {
+            return {queued: this.queue.map(j => j.id),
+              running: [...this.running.values()].map(r => ({id:r.job.id, attempt:r.attempt})),
+              finished: [...this.finished]};
+          }
+        }
+      schedules.js: |
+        // Deterministic transport schedules used by check.js; callbacks can be reentrant.
+        import assert from 'node:assert/strict';
+        export function exercise(Pool, seed) {
+          let x=seed>>>0;
+          const rand=n=>{x=(Math.imul(x,1664525)+1013904223)>>>0;return x%n;};
+          const live=new Map(), started=[], callbacks=[], events=[], violations=[];
+          const limit=1+rand(3);
+          let pool;
+          const start=(id,attempt)=>{
+            events.push(['start',id,attempt]);
+            if(live.has(attempt)) violations.push('attempt reused');
+            live.set(attempt,id);started.push([id,attempt]);
+            if(live.size>limit) violations.push('transport concurrency exceeded');
+            const finish=(outcome='ok')=>{live.delete(attempt);callbacks.push(()=>pool.complete(id,attempt,'ok'));pool.complete(id,attempt,outcome);};
+            // A completed operation can emit the callback again after ID reuse.
+            if ((seed&3)===0) finish();
+            return {cancel(){events.push(['cancel',id,attempt]);if ((seed&7)===3) finish('retry');}};
+          };
+          pool=new Pool(limit,start);
+          for(let i=0;i<160;i++) {
+            const id=['a','b','c','__proto__'][rand(4)];
+            const op=rand(5);events.push(['action',op,id]);
+            if(op<2) pool.submit(id);
+            else if(op===2) pool.cancel(id);
+            else if(op===3 && live.size) {
+              const [attempt,runningID]=[...live][rand(live.size)];
+              live.delete(attempt);callbacks.push(()=>pool.complete(runningID,attempt,'ok'));pool.complete(runningID,attempt,rand(4)===0?'retry':'ok');
+            } else if(callbacks.length) callbacks[rand(callbacks.length)]();
+            assert.deepEqual(violations,[]);
+            const view=pool.snapshot();
+            assert.equal(view.running.length,live.size,'slot accounting mismatch');
+            for(const item of view.running) assert.equal(live.get(item.attempt),item.id);
+          }
+          for(let i=0;i<1000 && (live.size || pool.snapshot().queued.length);i++) {
+            if(!live.size) throw new Error('queued work stalled');
+            for(const [attempt,id] of [...live]) {live.delete(attempt);pool.complete(id,attempt,'ok');}
+          }
+          assert.equal(pool.snapshot().running.length,0);
+          assert.equal(pool.snapshot().queued.length,0);
+          return {events,started};
+        }
+        export function contracts(Pool) {
+          const starts=[];let pool;
+          pool=new Pool(1,(id,attempt)=>{starts.push([id,attempt]);return {cancel(){}};});
+          pool.submit('a');pool.submit('b');pool.submit('c');
+          pool.complete('a',starts[0][1],'retry');
+          assert.equal(starts[1][0],'b','retry must go behind existing work');
+          pool.cancel('b');pool.submit('b');
+          const cancelled=starts[1];pool.complete(...cancelled,'retry');
+          assert.equal(starts[2][0],'c');
+          pool.complete(...cancelled,'ok');
+          assert.equal(pool.snapshot().running[0].id,'c');
+          // Reentrant completion of a long queue must be iterative.
+          let sync=false,first,completed=0;
+          const p=new Pool(1,(id,attempt)=>{if(!sync)first=[id,attempt];else{completed++;p.complete(id,attempt,'ok');}return {cancel(){}};});
+          p.submit('held');for(let i=0;i<20000;i++)p.submit('j'+i);
+          sync=true;p.complete(...first,'ok');assert.equal(completed,20000);
+        }
+      advanced.js: |
+        import assert from 'node:assert/strict';
+        // Independent event model. Transport callbacks are driven by explicit tapes.
+        class Model {
+         constructor(cap){this.cap=cap;this.caps={};this.q=[];this.live=new Map();this.jobs=new Map();this.done=new Set();this.next=0;this.events=[];}
+         submit(id,t='default',w=1){if(this.jobs.has(id))return;this.done.delete(id);let j={id,t,w,c:false};this.jobs.set(id,j);this.q.push(j);this.drain();}
+         cancel(id){let j=this.jobs.get(id);if(!j)return;j.c=true;this.jobs.delete(id);this.q=this.q.filter(x=>x!==j);for(let [a,x]of this.live)if(x===j)this.events.push(['cancel',id,a]);this.drain();}
+         configure(c,caps={}){this.cap=c;this.caps={...caps};this.drain();}
+         complete(id,a,o){let j=this.live.get(a);if(!j||j.id!==id)return;this.live.delete(a);if(!j.c){if(o==='retry')this.q.push(j);else{if(this.jobs.get(id)===j)this.jobs.delete(id);this.done.add(id);}}this.drain();}
+         drain(){for(;;){let total=0,by=new Map();for(let j of this.live.values()){total+=j.w;by.set(j.t,(by.get(j.t)||0)+j.w);}let i=this.q.findIndex(j=>total+j.w<=this.cap&&(by.get(j.t)||0)+j.w<=(Object.hasOwn(this.caps,j.t)?this.caps[j.t]:this.cap));if(i<0)return;let j=this.q.splice(i,1)[0],a=++this.next;this.live.set(a,j);this.events.push(['start',j.id,a]);}}
+         snapshot(){return{queued:this.q.map(j=>j.id),running:[...this.live].map(([attempt,j])=>({id:j.id,attempt})),finished:[...this.done]};}
+        }
+        export function weighted(Pool,seed){
+         let x=seed>>>0;const rnd=n=>{x^=x<<13;x^=x>>>17;x^=x<<5;return(x>>>0)%n;};
+         let events=[],actual=new Pool(6,(id,a)=>{events.push(['start',id,a]);return{cancel(){events.push(['cancel',id,a]);}}}),ref=new Model(6);
+         for(let step=0;step<700;step++){
+          let id=['a','b','c','d','__proto__','e','f'][rnd(7)],op=rnd(5),args;
+          if(op<2){args=[id,['east','west','__proto__'][rnd(3)],1+rnd(5)];actual.submit(...args);ref.submit(...args);}
+          else if(op===2){actual.cancel(id);ref.cancel(id);}
+          else if(op===3){let cap=1+rnd(8),limits=JSON.parse('{"east":'+rnd(6)+',"__proto__":'+rnd(5)+'}');actual.configure(cap,limits);ref.configure(cap,limits);limits.east=10000;}
+          else {let a=1+rnd(ref.next+2),j=ref.live.get(a),who=j?j.id:id,out=rnd(3)?'ok':'retry';actual.complete(who,a,out);ref.complete(who,a,out);}
+          assert.deepEqual(actual.snapshot(),ref.snapshot(),`seed=${seed} step=${step}`);
+          assert.deepEqual(events,ref.events,`dispatch seed=${seed} step=${step}`);
+          const snap=actual.snapshot();snap.queued.splice(0);if(snap.running[0])snap.running[0].id='mutated';snap.finished.push('mutated');
+         }
+        }
+        export function nested(Pool){
+         let p,events=[],live=new Map(),depth=0,max=0;
+         p=new Pool(5,(id,a)=>{
+          depth++;max=Math.max(max,depth);events.push(['start',id,a]);live.set(a,id);
+          if(id==='old'&&events.filter(e=>e[0]==='start'&&e[1]==='old').length===1){p.cancel(id);p.submit(id,'west',3);p.configure(3,{west:3,east:0});}
+          if(id==='sync'){live.delete(a);p.complete(id,a,'ok');depth--;throw Error('after success');}
+          depth--;return{cancel(){events.push(['cancel',id,a]);throw Error('transport still live');}};
+         });
+         p.submit('old','east',4);assert.equal(events.filter(e=>e[0]==='cancel').length,1);assert.equal(p.snapshot().running.length,1);
+         const a=p.snapshot().running[0].attempt;p.complete('old',a,'retry');
+         assert.deepEqual(p.snapshot().queued,[]);assert.equal(p.snapshot().running.length,1);
+         // The replacement also invokes the callback: use another pool for bounded nested lifecycle.
+         let h,cancels=0;
+         h=new Pool(2,(id,a)=>{if(id==='x'){h.cancel('x');h.submit('y','b',2);}return{cancel(){cancels++;h.complete(id,a,'retry');h.configure(2,{b:2});}};});
+         h.submit('x','a',2);assert.equal(cancels,1);assert.equal(h.snapshot().running[0].id,'y');
+         let z;
+         z=new Pool(1,(id,a)=>{z.complete(id,a,'ok');throw Error('late throw');});
+         z.submit('z');assert.deepEqual(z.snapshot(),{queued:[],running:[],finished:['z']});
+        }
+        export function validation(Pool){
+         let p=new Pool(2,()=>({cancel(){}}));
+         for(let args of [['bad','t',0],['bad','t',1.5],['bad','t',NaN]])assert.throws(()=>p.submit(...args));
+         for(let args of [[0,{}],[2,{t:-1}],[2,{t:1.5}]])assert.throws(()=>p.configure(...args));
+         p.submit('a');let a=p.snapshot().running[0].attempt;assert.throws(()=>p.complete('a',a,'unknown'),RangeError);assert.equal(p.snapshot().running.length,1);
+        }
+prompt: |
+  Our weighted multi-tenant rollout produces stalls and occasional over-admission after quota changes. Upgrade pool.js to the current SPEC.txt contract, retain existing lifecycle semantics, and diagnose the interaction failures. Run check() and retain reproducible evidence for the fix.

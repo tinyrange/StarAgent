@@ -18,6 +18,7 @@ type agentsFile struct {
 	Version     int                     `yaml:"version"`
 	Environemnt map[string]string       `yaml:"environment"`
 	Imports     map[string]importConfig `yaml:"imports"`
+	Workflows   *bool                   `yaml:"workflows"`
 	Workspace   struct {
 		Read        bool     `yaml:"read"`
 		Write       bool     `yaml:"write"`
@@ -77,6 +78,11 @@ func loadAgentsYaml(root *os.Root, contents []byte) (starlark.StringDict, error)
 
 		ret[name] = result[name]
 	}
+	if agents.Workflows == nil || *agents.Workflows {
+		if err := loadWorkflows(root, ret); err != nil {
+			return nil, fmt.Errorf("workflows: %w", err)
+		}
+	}
 
 	return ret, nil
 }
@@ -129,10 +135,15 @@ func RunWorkspace(cwd string) error {
 		documentation = append(documentation, name+":\n"+doc)
 	}
 
-	return repl.Start(repl.Options{
+	opts := repl.Options{
 		SyntaxOptions: &starlarkOptions,
 		Thread:        &starlark.Thread{Name: "service repl"},
 		Environment:   env,
 		Documentation: strings.Join(documentation, "\n\n"),
-	})
+	}
+	if workflows, ok := env["workflows"].(*workflows); ok {
+		defer workflows.root.Close()
+		opts.Prepare = workflows.prepare
+	}
+	return repl.Start(opts)
 }

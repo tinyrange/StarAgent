@@ -29,7 +29,20 @@ func TestOpenAIFailuresAreRecorded(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveTokenCount(w, r) {
+					return
+				}
 				w.WriteHeader(tt.status)
+				var body map[string]any
+				if tt.status == 200 && json.Unmarshal([]byte(tt.response), &body) == nil {
+					if usage, ok := body["usage"].(map[string]any); ok {
+						usage["input_tokens_details"] = map[string]int{"cached_tokens": 0, "cache_write_tokens": 0}
+					} else {
+						body["usage"] = mockUsage
+					}
+					json.NewEncoder(w).Encode(body)
+					return
+				}
 				fmt.Fprint(w, tt.response)
 			}))
 			defer api.Close()
@@ -69,6 +82,9 @@ func TestOpenAIRecoversFromAgentCodeErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			requests := 0
 			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if serveTokenCount(w, r) {
+					return
+				}
 				requests++
 				var request struct {
 					Input []map[string]any `json:"input"`
@@ -96,7 +112,7 @@ func TestOpenAIRecoversFromAgentCodeErrors(t *testing.T) {
 					}
 					output = map[string]any{"type": "message", "content": []any{map[string]any{"type": "output_text", "text": "Recovered."}}}
 				}
-				json.NewEncoder(w).Encode(map[string]any{"status": "completed", "output": []any{output}})
+				json.NewEncoder(w).Encode(map[string]any{"status": "completed", "output": []any{output}, "usage": mockUsage})
 			}))
 			defer api.Close()
 			server := sessionTestServer(t)
