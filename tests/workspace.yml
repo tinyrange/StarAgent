@@ -2,6 +2,7 @@ version: 1
 provider:
   name: test
   scripts:
+    # Workspace
     - service: main
       script: print(workspace.read_file("go.mod"))
     - service: main
@@ -12,9 +13,17 @@ provider:
         workspace.delete_file("local/hello.txt")
         print(workspace.exists("local/hello.txt"))
     - service: main
+      script: |
+        print(workspace.list_dir("."))
+        print(workspace.glob("**/*.go"))
+
+    # Safety
+    - service: main
       should_fail: true
       script: |
         workspace.write_file("AGENTS.yml", "hello")
+
+    # Shell Commands
     - service: main
       should_fail: true
       script: |
@@ -22,6 +31,8 @@ provider:
     - service: main
       script: |
         print(whoami())
+
+    # Docs
     - service: main
       script: |
         print(help(whoami))
@@ -31,6 +42,12 @@ provider:
     - service: main
       script: |
         print(help(workspace.read_file))
+
+    # Stdlib
+    - service: main
+      script: |
+        print(go.format_check("./..."))
+        print(go.build_check("./cmd/sa-service"))
 services:
   main:
     kind: shell-repl

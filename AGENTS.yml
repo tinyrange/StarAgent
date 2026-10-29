@@ -7,6 +7,13 @@ workspace:
   denied_files:
     - AGENTS.yml
 
+imports:
+  go:
+    path: "//stdlib/golang.star"
+    tools:
+      build_check: true
+      format_check: true
+
 environment:
   hello: |
     def hello(world):

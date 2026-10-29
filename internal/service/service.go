@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 
 	"go.starlark.net/starlark"
@@ -15,8 +16,9 @@ import (
 )
 
 type agentsFile struct {
-	Version     int               `yaml:"version"`
-	Environemnt map[string]string `yaml:"environment"`
+	Version     int                     `yaml:"version"`
+	Environemnt map[string]string       `yaml:"environment"`
+	Imports     map[string]importConfig `yaml:"imports"`
 	Workspace   struct {
 		Read        bool     `yaml:"read"`
 		Write       bool     `yaml:"write"`
@@ -53,6 +55,14 @@ func loadAgentsYaml(root *os.Root, contents []byte) (starlark.StringDict, error)
 			root: root, read: agents.Workspace.Read, write: agents.Workspace.Write,
 			deniedFiles: agents.Workspace.DeniedFiles,
 		}
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(agents.Imports)) {
+		module, err := loadImport(root, name, agents.Imports[name])
+		if err != nil {
+			return nil, fmt.Errorf("import %s: %w", name, err)
+		}
+		ret[name] = module
 	}
 
 	for name, script := range agents.Environemnt {
