@@ -21,6 +21,7 @@ provider:
     - service: main
       script: |
         print(workspace.list_dir("."))
+        check(workspace.list_dir().paths == workspace.list_dir(".").paths, "default list directory")
         print(workspace.glob("**/*.go"))
     - service: main
       script: |
@@ -191,6 +192,10 @@ provider:
         print(json.encode({"hello": True}))
 
     # Builtin
+    - script: |
+        output = service.get("main").exec('print("a", "b", sep="|", end="")')
+        if output != "a|b":
+            fail("service print did not preserve exact output: " + repr(output))
     - script: |
         print(service.list())
         print(service.get("main").exec("print(2+2)"))

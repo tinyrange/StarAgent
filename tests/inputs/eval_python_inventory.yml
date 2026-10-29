@@ -1,0 +1,62 @@
+# Evaluation focus: state isolation, aggregation, and regression checks
+# Run only after review; live recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+developer: "Keep changes small and preserve public APIs unless the task asks for a change. Use the available checks and report their results. If a required toolchain is missing, report that rather than installing it."
+services:
+  main:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "check.py"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Run Python inventory regression checks."
+                return privileged.shell("python3", "-B", "check.py", timeout=30).run()
+      README.md: |
+        # Inventory totals
+        Python 3; standard library only. Run `python3 -B check.py` or the service's check().
+        inventory.totals_by_customer(orders) returns a fresh mapping of customer ID to
+        total shipped value in integer cents. Orders have customer, status, quantity,
+        and unit_cents fields; quantities and prices are nonnegative integers.
+      inventory.py: |
+        def totals_by_customer(orders, totals={}):
+            for order in orders:
+                if order["status"] == "shipped":
+                    totals[order["customer"]] = order["quantity"] * order["unit_cents"]
+            return totals
+      check.py: |
+        import copy
+        from inventory import totals_by_customer
+
+        orders = [
+            dict(customer="ada", status="shipped", quantity=2, unit_cents=150),
+            dict(customer="ada", status="shipped", quantity=1, unit_cents=75),
+            dict(customer="lin", status="cancelled", quantity=9, unit_cents=100),
+            dict(customer="sam", status="shipped", quantity=0, unit_cents=100),
+        ]
+        before = copy.deepcopy(orders)
+        first = totals_by_customer(orders)
+        assert first == {"ada": 375, "sam": 0}, first
+        assert orders == before, "input orders changed"
+        second = totals_by_customer([])
+        assert second == {}, second
+        assert first == {"ada": 375, "sam": 0}, "later call changed an earlier result"
+        second["outsider"] = 1
+        assert totals_by_customer([]) == {}, "caller mutation leaked into another report"
+        print("inventory checks passed")
+prompt: |
+  The inventory report is wrong when a customer has multiple orders, and running another
+  report in the same process sometimes includes customers from the previous report.
+  Fix totals_by_customer so it sums quantity * unit_cents for shipped orders only.
+  Omit customers with no shipped orders, leave the input untouched, and make every call
+  independent. Keep the existing function name and integer-cent arithmetic.

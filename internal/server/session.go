@@ -26,8 +26,15 @@ func (s *Session) OnMessage(kind, text string) error {
 	return nil
 }
 
+func (s *Session) OnUsage(usage TokenUsage) error { return nil }
+
 // OnToolCall implements [TurnCallbacks].
 func (s *Session) OnToolCall(ctx context.Context, _ string, serviceName string, line string) (string, error) {
+	if _, running := s.services[serviceName]; !running {
+		if _, configured := s.serviceConfigs[serviceName]; !configured {
+			return fmt.Sprintf("error: unknown service %q\n", serviceName), nil
+		}
+	}
 	service, err := s.getService(ctx, serviceName)
 	if err != nil {
 		return "", err

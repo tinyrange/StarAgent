@@ -23,6 +23,11 @@ type Options struct {
 	Output io.Writer
 }
 
+// FileOptions is the Starlark dialect used by every agent REPL.
+func FileOptions() syntax.FileOptions {
+	return syntax.FileOptions{Set: true, While: true, TopLevelControl: true, GlobalReassign: true, Recursion: true}
+}
+
 func Start(opts Options) error {
 	if opts.Input == nil {
 		opts.Input = os.Stdin
@@ -44,14 +49,16 @@ func Start(opts Options) error {
 		if err != nil {
 			return fmt.Errorf("failed to exchange: %w", err)
 		}
-		evalErr := evaluate(opts, input, output)
+		evalErr := Evaluate(opts, input, output)
 		if err := errors.Join(evalErr, output.Close()); err != nil {
 			return err
 		}
 	}
 }
 
-func evaluate(opts Options, input string, output io.Writer) error {
+// Evaluate writes parse/evaluation errors to output so the next call can recover.
+// Returned errors are output failures, not errors in the agent's code.
+func Evaluate(opts Options, input string, output io.Writer) error {
 	parsed, err := opts.SyntaxOptions.Parse("<repl>", input, syntax.RetainComments)
 	if err != nil {
 		_, writeErr := fmt.Fprintf(output, "%v\n", err)
@@ -59,10 +66,18 @@ func evaluate(opts Options, input string, output io.Writer) error {
 	}
 
 	var printErr error
-	opts.Thread.Print = func(thread *starlark.Thread, msg string) {
+	write := func(msg string) {
 		if printErr == nil {
-			_, printErr = fmt.Fprintln(output, msg)
+			_, printErr = io.WriteString(output, msg)
 		}
+	}
+	opts.Thread.SetLocal("repl.print", write)
+	opts.Thread.Print = func(_ *starlark.Thread, msg string) { write(msg + "\n") }
+	if opts.Environment == nil {
+		opts.Environment = make(starlark.StringDict)
+	}
+	if _, exists := opts.Environment["print"]; !exists {
+		opts.Environment["print"] = Print
 	}
 
 	// A lone expression should display its value, as in the Starlark REPL.

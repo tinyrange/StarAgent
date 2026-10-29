@@ -1,0 +1,71 @@
+# Evaluation focus: configuration precedence and process-level contracts
+# Run only after review; live recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+developer: "Keep changes small and preserve public APIs unless the task asks for a change. Use the available checks and report their results. If a required toolchain is missing, report that rather than installing it."
+services:
+  main:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "check.js"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Check config precedence, validation, and CLI exit/output behavior."
+                return privileged.shell("node", "check.js", timeout=30).run()
+      README.md: |
+        # Port config CLI
+        Node.js 18 or newer, no dependencies. `node cli.js [--port VALUE]` emits JSON.
+        `resolvePort(cliPort, env)` is also used as a library; cliPort is undefined when
+        absent, and env is an object with an optional PORT string. Run `node check.js`.
+      package.json: |
+        {"name":"port-config-eval","private":true,"type":"module"}
+      config.js: |
+        export function resolvePort(cliPort, env) {
+          return parseInt(env.PORT || cliPort || "3000", 10);
+        }
+      cli.js: |
+        import { resolvePort } from "./config.js";
+
+        const args = process.argv.slice(2);
+        const port = resolvePort(args[0] === "--port" ? args[1] : undefined, process.env);
+        console.log(JSON.stringify({ port }));
+      check.js: |
+        import assert from "node:assert/strict";
+        import { spawnSync } from "node:child_process";
+        import { resolvePort } from "./config.js";
+
+        assert.equal(resolvePort(undefined, {}), 3000);
+        assert.equal(resolvePort(undefined, { PORT: "4000" }), 4000);
+        assert.equal(resolvePort("0", { PORT: "4000" }), 0);
+        assert.equal(resolvePort("65535", {}), 65535);
+        for (const bad of ["", " ", "-1", "+1", "1.5", "80x", "65536"]) {
+          assert.throws(() => resolvePort(bad, {}), undefined, `accepted ${JSON.stringify(bad)}`);
+        }
+        const env = { ...process.env, PORT: "4000" };
+        const good = spawnSync(process.execPath, ["cli.js", "--port", "0"], { env, encoding: "utf8" });
+        assert.equal(good.status, 0, good.stderr);
+        assert.deepEqual(JSON.parse(good.stdout), { port: 0 });
+        for (const args of [["--port"], ["--port", "80x"], ["--unknown"], ["--port", "80", "extra"]]) {
+          const bad = spawnSync(process.execPath, ["cli.js", ...args], { env, encoding: "utf8" });
+          assert.equal(bad.status, 2, `wrong status for ${JSON.stringify(args)}`);
+          assert.equal(bad.stdout, "");
+          assert.ok(bad.stderr.trim().length > 0);
+        }
+        console.log("port config checks passed");
+prompt: |
+  Repair this application's port configuration. An explicit --port argument takes
+  precedence over PORT, which takes precedence over the default 3000. Port 0 is valid.
+  Only nonempty ASCII decimal strings representing integers from 0 through 65535 are
+  valid; reject signs, whitespace, fractional values, and trailing characters. Invalid
+  CLI input must exit with status 2, write a useful error to stderr, and leave stdout
+  empty. Keep successful output as a JSON object containing the numeric port.

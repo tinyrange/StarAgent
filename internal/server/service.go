@@ -2,14 +2,12 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 
 	"github.com/tinyrange/staragent/internal/repl"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
-	"go.starlark.net/syntax"
 )
 
 type ServiceFactory interface {
@@ -36,40 +34,17 @@ func (s *serverService) Close() error {
 
 // Documentation implements [Service].
 func (s *serverService) Documentation(ctx context.Context) (string, error) {
-	return serviceDoc, nil
+	return serviceDoc + "\n\n" + repl.PrintDoc, nil
 }
 
 // ExecuteLine implements [Service].
 func (s *serverService) ExecuteLine(ctx context.Context, line string) (string, error) {
-	opts := s.getOptions()
-
-	file, err := opts.Parse("<repl>", line, syntax.RetainComments)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse: %w", err)
-	}
-
-	thread := s.getThread()
+	opts := repl.FileOptions()
+	thread := &starlark.Thread{Name: "server repl"}
 	thread.SetLocal("context", ctx)
 	var output strings.Builder
-	thread.Print = func(_ *starlark.Thread, msg string) {
-		fmt.Fprintln(&output, msg)
-	}
-
-	if err := starlark.ExecREPLChunk(file, thread, s.declared); err != nil {
-		return "", fmt.Errorf("failed to execute: %w", err)
-	}
-
-	return output.String(), nil
-}
-
-func (s *serverService) getOptions() syntax.FileOptions {
-	return syntax.FileOptions{Set: true, While: true}
-}
-
-func (s *serverService) getThread() *starlark.Thread {
-	return &starlark.Thread{
-		Name: "repl",
-	}
+	err := repl.Evaluate(repl.Options{SyntaxOptions: &opts, Thread: thread, Environment: s.declared}, line, &output)
+	return output.String(), err
 }
 
 func (s *serverService) Init(ctx context.Context) error {

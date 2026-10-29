@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/tinyrange/staragent/internal/repl"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
 )
@@ -44,6 +45,7 @@ func loadImport(root *os.Root, name string, config importConfig) (starlark.Value
 	globals, err := starlark.ExecFileOptions(&starlarkOptions, &starlark.Thread{Name: config.Path}, config.Path, source, starlark.StringDict{
 		"privileged": &privileged{cwd: root.Name()},
 		"struct":     starlark.NewBuiltin("struct", starlarkstruct.Make),
+		"print":      repl.Print,
 	})
 	if err != nil {
 		return nil, err

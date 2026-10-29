@@ -1,0 +1,86 @@
+# Evaluation focus: C input validation, overflow, and output ownership
+# Run only after review; live recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+developer: "Keep changes small and preserve public APIs unless the task asks for a change. Use the available checks and report their results. If a required toolchain is missing, report that rather than installing it."
+services:
+  main:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "check.c"]
+        environment:
+          check: |
+            def check():
+                """check() -> result: Compile with C11 warnings as errors, then run parser checks."""
+                compiled = privileged.shell("cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic", "parser.c", "check.c", "-o", ".parser-check", timeout=30).run()
+                if not compiled.ok:
+                    return compiled
+                return privileged.shell("./.parser-check", timeout=10).run()
+      README.md: |
+        # Count parser
+        Requires a C11 compiler named cc. No libraries or build system.
+        check() compiles parser.c with check.c and then runs the resulting executable.
+        Both compilation failures and failed assertions are returned as results.
+      parser.h: |
+        #ifndef PARSER_H
+        #define PARSER_H
+        int parse_count(const char *text, int *out);
+        #endif
+      parser.c: |
+        #include "parser.h"
+        #include <stdlib.h>
+
+        int parse_count(const char *text, int *out) {
+            *out = atoi(text);
+            return *out >= 0 && *out <= 1000;
+        }
+      check.c: |
+        #include "parser.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+
+        static void expect(const char *text, int valid, int expected) {
+            int value = 4321;
+            int result = parse_count(text, &value);
+            if (result != valid || value != expected) {
+                fprintf(stderr, "parse_count(%s): got (%d, %d), expected (%d, %d)\n",
+                        text, result, value, valid, expected);
+                exit(1);
+            }
+        }
+
+        int main(void) {
+            expect("0", 1, 0);
+            expect("1000", 1, 1000);
+            expect("00042", 1, 42);
+            const char *bad[] = {"", "-1", "+1", " 1", "1 ", "12x", "1.0", "1001"};
+            for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
+                expect(bad[i], 0, 4321);
+            }
+            char huge[2048];
+            memset(huge, '9', sizeof huge - 1);
+            huge[sizeof huge - 1] = '\0';
+            expect(huge, 0, 4321);
+            memset(huge, '0', sizeof huge - 1);
+            huge[sizeof huge - 2] = '7';
+            expect(huge, 1, 7);
+            puts("C parser checks passed");
+            return 0;
+        }
+prompt: |
+  Harden parse_count without changing its signature. Accept only a nonempty string of
+  ASCII digits whose value is between 0 and 1000 inclusive; leading zeroes are allowed.
+  Return 1 and set *out on success. On any invalid input, return 0 and leave *out
+  unchanged. The caller supplies non-null pointers. Out-of-range digit strings must be
+  rejected safely even when thousands of characters long. This project uses plain C
+  with no build system.

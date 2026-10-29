@@ -1,0 +1,93 @@
+# Evaluation focus: incremental builds and avoiding unnecessary rebuilds
+# Run only after review; live recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+developer: "Keep changes small and preserve public APIs unless the task asks for a change. Use the available checks and report their results. If a required toolchain is missing, report that rather than installing it."
+services:
+  main:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "check.py", "config.h", "greeting.h", "greeting.c", "main.c"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Check clean, header-triggered, and no-op builds; restore header and clean afterward."
+                return privileged.shell("python3", "-B", "check.py", timeout=30).run()
+      README.md: |
+        # Greeting build
+        Requires make, cc, and Python 3. Run `make`, then `./greet`.
+        check() runs `python3 -B check.py`, which checks a clean build, a header edit,
+        and a no-op rebuild. It restores the header and cleans build artifacts afterward.
+      config.h: |
+        #define GREETING "Hello"
+      greeting.h: |
+        const char *greeting(void);
+      greeting.c: |
+        #include "config.h"
+        #include "greeting.h"
+        const char *greeting(void) { return GREETING; }
+      main.c: |
+        #include <stdio.h>
+        #include "greeting.h"
+        int main(void) { puts(greeting()); return 0; }
+      Makefile: |
+        CC = cc
+        CFLAGS = -std=c11 -Wall -Wextra -Werror
+        OBJECTS = main.o greeting.o
+
+        .PHONY: all clean
+        all: greet
+
+        greet: $(OBJECTS)
+        	$(CC) $(LDFLAGS) -o $@ $(OBJECTS)
+
+        %.o: %.c
+        	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+        clean:
+        	rm -f greet $(OBJECTS)
+      check.py: |
+        from pathlib import Path
+        import subprocess
+        import time
+
+        def run(*args):
+            result = subprocess.run(args, capture_output=True, text=True)
+            assert result.returncode == 0, result.stdout + result.stderr
+            return result.stdout
+
+        header = Path("config.h")
+        original = header.read_text()
+        try:
+            run("make", "clean")
+            run("make")
+            assert run("./greet") == "Hello\n"
+            time.sleep(1.1)  # Ensure distinct mtimes even on coarse filesystems.
+            header.write_text('#define GREETING "Welcome"\n')
+            run("make")
+            assert run("./greet") == "Welcome\n", "header edit did not reach executable"
+            outputs = [Path(name) for name in ("main.o", "greeting.o", "greet")]
+            before = [p.stat().st_mtime_ns for p in outputs]
+            time.sleep(1.1)
+            run("make")
+            assert [p.stat().st_mtime_ns for p in outputs] == before, "no-op make rebuilt outputs"
+        finally:
+            header.write_text(original)
+            run("make", "clean")
+        print("Makefile checks passed")
+prompt: |
+  The greeting program builds from clean, but changing config.h does not update the
+  executable on the next make. Fix the Makefile so header changes rebuild the affected
+  objects and relink. A subsequent make with no changes must leave object files and
+  the executable untouched. Keep compilation separate from linking, preserve clean,
+  and do not solve this by rebuilding everything on every invocation. Change only the
+  Makefile; the program and regression check are fixtures.

@@ -1,0 +1,186 @@
+# Evaluation focus: coordinating a contract change across three isolated language services
+# Run only after review; live recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+developer: "Keep changes small and preserve public APIs unless the task asks for a change. Use the available checks and report their results. If a required toolchain is missing, report that rather than installing it."
+services:
+  producer:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "check.py"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Check the Python receipt producer against the v2 contract."
+                return privileged.shell("python3", "-B", "check.py", timeout=30).run()
+          sample: |
+            def sample():
+                """sample() -> str: Generate a 1234-cent receipt as JSON using the current producer."""
+                return privileged.shell("python3", "-B", "receipt.py", timeout=10).output()
+      README.md: |
+        # Receipt producer (Python 3)
+        Receipt v2 is a JSON object with amount_cents, a nonnegative integer.
+        This service's implementation still emits the old total_cents field.
+        check() tests the new contract. sample() returns JSON for a 1234-cent receipt.
+        make_receipt(items) receives integer price_cents and quantity fields.
+      receipt.py: |
+        import json
+
+        def make_receipt(items):
+            return {"total_cents": sum(item["price_cents"] * item["quantity"] for item in items)}
+
+        if __name__ == "__main__":
+            print(json.dumps(make_receipt([{"price_cents": 617, "quantity": 2}]), sort_keys=True))
+      check.py: |
+        from receipt import make_receipt
+
+        assert make_receipt([]) == {"amount_cents": 0}
+        assert make_receipt([{"price_cents": 617, "quantity": 2}]) == {"amount_cents": 1234}
+        assert make_receipt([{"price_cents": 1, "quantity": 2}, {"price_cents": 3, "quantity": 4}]) == {"amount_cents": 14}
+        print("producer contract checks passed")
+  consumer:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "receipt_test.go"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Test the Go receipt consumer against the v2 contract."
+                return privileged.shell("go", "test", "-count=1", "./...", timeout=60, env={"GOTOOLCHAIN": "local", "GOWORK": "off", "GOPROXY": "off"}).run()
+          inspect: |
+            def inspect(payload):
+                """inspect(payload: str) -> result: Decode receipt JSON with the current Go consumer; stdout is the amount in cents."""
+                return privileged.shell("go", "run", "./cmd/inspect", payload, env={"GOTOOLCHAIN": "local", "GOWORK": "off", "GOPROXY": "off"}, timeout=60).run()
+      README.md: |
+        # Receipt consumer (Go 1.22+)
+        Receipt v2 requires amount_cents as a nonnegative integer. Old-only payloads,
+        missing values, negative values, and fractional values must be rejected.
+        Amount returns that integer. check() runs Go tests; inspect(payload) accepts
+        a JSON string and returns a command result with the extracted amount in stdout.
+        There are no external modules.
+      go.mod: |
+        module example.test/receipt
+
+        go 1.22
+      receipt.go: |
+        package receipt
+
+        import (
+        	"encoding/json"
+        	"fmt"
+        )
+
+        func Amount(data []byte) (int, error) {
+        	var value struct { TotalCents *int `json:"total_cents"` }
+        	if err := json.Unmarshal(data, &value); err != nil { return 0, err }
+        	if value.TotalCents == nil || *value.TotalCents < 0 {
+        		return 0, fmt.Errorf("total_cents must be a nonnegative integer")
+        	}
+        	return *value.TotalCents, nil
+        }
+      receipt_test.go: |
+        package receipt
+
+        import "testing"
+
+        func TestContract(t *testing.T) {
+        	for _, tc := range []struct { data string; want int; bad bool }{
+        		{`{"amount_cents":1234}`, 1234, false},
+        		{`{"amount_cents":0}`, 0, false},
+        		{`{"total_cents":1234}`, 0, true},
+        		{`{}`, 0, true},
+        		{`{"amount_cents":-1}`, 0, true},
+        		{`{"amount_cents":1.5}`, 0, true},
+        	} {
+        		got, err := Amount([]byte(tc.data))
+        		if (err != nil) != tc.bad || (!tc.bad && got != tc.want) {
+        			t.Errorf("%s: got %d, %v", tc.data, got, err)
+        		}
+        	}
+        }
+      cmd/inspect/main.go: |
+        package main
+
+        import (
+        	"fmt"
+        	"os"
+        	"example.test/receipt"
+        )
+
+        func main() {
+        	if len(os.Args) != 2 { fmt.Fprintln(os.Stderr, "expected one JSON argument"); os.Exit(2) }
+        	amount, err := receipt.Amount([]byte(os.Args[1]))
+        	if err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(1) }
+        	fmt.Println(amount)
+        }
+  viewer:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "check.js"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Check receipt labels and v2 input validation."
+                return privileged.shell("node", "check.js", timeout=30).run()
+          inspect: |
+            def inspect(payload):
+                """inspect(payload: str) -> result: Render receipt JSON with the current Node viewer; stdout is the dollar label."""
+                return privileged.shell("node", "inspect.js", payload, timeout=10).run()
+      README.md: |
+        # Receipt display (Node.js 18+)
+        Receipt v2 requires amount_cents, a nonnegative integer. label(receipt) returns
+        a dollar amount with exactly two decimal places. Old-only payloads and invalid
+        amounts must throw. check() checks the contract; inspect(payload) returns a
+        command result with the rendered label in stdout. No npm packages are needed.
+      package.json: |
+        {"name":"receipt-viewer-eval","private":true,"type":"module"}
+      receipt.js: |
+        export function label(receipt) {
+          if (!Number.isInteger(receipt.total_cents) || receipt.total_cents < 0) {
+            throw new Error("total_cents must be a nonnegative integer");
+          }
+          return `$${(receipt.total_cents / 100).toFixed(2)}`;
+        }
+      check.js: |
+        import assert from "node:assert/strict";
+        import { label } from "./receipt.js";
+
+        assert.equal(label({ amount_cents: 1234 }), "$12.34");
+        assert.equal(label({ amount_cents: 0 }), "$0.00");
+        assert.equal(label({ amount_cents: 1 }), "$0.01");
+        for (const receipt of [{ total_cents: 1234 }, {}, { amount_cents: -1 }, { amount_cents: 1.5 }]) {
+          assert.throws(() => label(receipt));
+        }
+        console.log("viewer contract checks passed");
+      inspect.js: |
+        import { label } from "./receipt.js";
+        console.log(label(JSON.parse(process.argv[2])));
+prompt: |
+  Migrate the receipt JSON contract from total_cents to amount_cents across all three
+  services: producer (Python), consumer (Go), and viewer (Node). The amount remains a
+  nonnegative integer number of cents. The producer must emit only the new field;
+  the consumer and viewer must reject payloads that contain only the old field.
+  Keep the existing public function names and displayed dollar formatting. Run each
+  service's checks, then generate a receipt with producer.sample() and pass that exact
+  JSON to consumer.inspect() and viewer.inspect() to verify the services agree.

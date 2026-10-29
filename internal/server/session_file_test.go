@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinyrange/staragent/internal/repl"
 	"github.com/tinyrange/staragent/internal/service"
 	"gopkg.in/yaml.v3"
 )
@@ -104,7 +105,7 @@ func TestSessionInputRecordReplay(t *testing.T) {
 				t.Errorf("incorrect initial messages: %#v", body.Input)
 				return
 			}
-			if body.Input[1]["content"] != "Service \"\":\n"+serviceDoc || !strings.HasPrefix(body.Input[2]["content"].(string), "Service \"main\":\n") || !strings.Contains(body.Input[2]["content"].(string), "workspace.read_file") {
+			if body.Input[1]["content"] != "Service \"\":\n"+serviceDoc+"\n\n"+repl.PrintDoc || !strings.HasPrefix(body.Input[2]["content"].(string), "Service \"main\":\n") || !strings.Contains(body.Input[2]["content"].(string), "workspace.read_file") {
 				t.Error("service documentation is not in separate developer messages")
 			}
 			output = []any{reasoning, commentary, map[string]any{"type": "function_call", "call_id": "call_1", "name": "exec", "arguments": string(arguments)}}
@@ -124,7 +125,8 @@ func TestSessionInputRecordReplay(t *testing.T) {
 		default:
 			t.Error("unexpected API call")
 		}
-		json.NewEncoder(w).Encode(map[string]any{"status": "completed", "output": output})
+		usage := json.RawMessage(fmt.Sprintf(`{"input_tokens":%d,"input_tokens_details":{"cached_tokens":8},"output_tokens":40,"output_tokens_details":{"reasoning_tokens":30},"total_tokens":%d}`, requests*100, requests*100+40))
+		json.NewEncoder(w).Encode(map[string]any{"status": "completed", "output": output, "usage": usage})
 	}))
 	defer api.Close()
 	server := sessionTestServer(t)
@@ -147,11 +149,17 @@ func TestSessionInputRecordReplay(t *testing.T) {
 		}
 		kinds = append(kinds, message.Kind)
 	}
-	if got := strings.Join(kinds, ","); got != "system,developer,developer,user,reasoning,commentary,tool_call,tool_result,end_turn" {
+	if got := strings.Join(kinds, ","); got != "system,developer,developer,user,usage,reasoning,commentary,tool_call,tool_result,usage,end_turn" {
 		t.Fatalf("unexpected messages: %s", got)
 	}
-	if log.Messages[6].Description != description {
+	if log.Messages[7].Description != description {
 		t.Fatal("exec description was not recorded on the call")
+	}
+	for i, index := range []int{4, 9} {
+		usage := log.Messages[index].Usage
+		if usage == nil || usage.InputTokens != (i+1)*100 || usage.OutputTokens != 40 || usage.TotalTokens != (i+1)*100+40 || usage.OutputTokensDetails == nil || usage.OutputTokensDetails.ReasoningTokens == nil || *usage.OutputTokensDetails.ReasoningTokens != 30 || usage.InputTokensDetails == nil || usage.InputTokensDetails.CachedTokens == nil || *usage.InputTokensDetails.CachedTokens != 8 {
+			t.Fatalf("incorrect usage for response %d: %#v", i+1, usage)
+		}
 	}
 	var originalDir string
 	for _, session := range server.sessions {
@@ -171,7 +179,7 @@ func TestSessionInputRecordReplay(t *testing.T) {
 	if err := log.replay(t.Context(), sessionTestServer(t)); err != nil {
 		t.Fatal(err)
 	}
-	log.Messages[7].Text = "wrong\n"
+	log.Messages[8].Text = "wrong\n"
 	if err := log.replay(t.Context(), sessionTestServer(t)); err == nil || !strings.Contains(err.Error(), "result mismatch") {
 		t.Fatalf("mismatch not detected: %v", err)
 	}
@@ -195,6 +203,11 @@ func TestSessionLogsAreRetained(t *testing.T) {
 			t.Fatalf("unexpected log directory: %s", file.Name())
 		}
 		stamp := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(file.Name()), "session-"), ".yml")
+		stamp, suffix, ok := strings.Cut(stamp, "Z-")
+		if !ok || suffix == "" {
+			t.Fatalf("missing unique suffix: %s", file.Name())
+		}
+		stamp += "Z"
 		if _, err := time.Parse("2006-01-02T15-04-05.000000000Z", stamp); err != nil {
 			t.Fatal(err)
 		}
@@ -240,7 +253,7 @@ func TestReplayValidationAndErrors(t *testing.T) {
 		{Kind: "tool_call", Service: "main", Script: `fail("expected")`},
 		{Kind: "tool_result", Service: "main", Text: "error: fail: expected\n"},
 		{Kind: "tool_call", Service: "missing", Script: "pass"},
-		{Kind: "tool_result", Service: "missing", Error: "failed to find service [missing] on session"},
+		{Kind: "tool_result", Service: "missing", Text: "error: unknown service \"missing\"\n"},
 		{Kind: "end_turn"},
 	}}
 	if err := log.replay(t.Context(), sessionTestServer(t)); err != nil {
@@ -296,7 +309,7 @@ func TestReplayDocumentation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(text, `workspace(root="."`) {
+	if !strings.Contains(text, "workspace: existing workspace object\nConfig: root=\".\"") {
 		t.Fatalf("unstable workspace documentation: %s", text)
 	}
 	if err := r.OnMessage("end_turn", "done"); err != nil {

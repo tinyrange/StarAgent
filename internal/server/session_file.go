@@ -38,13 +38,14 @@ type sessionLog struct {
 }
 
 type sessionMessage struct {
-	Timestamp   time.Time `yaml:"timestamp,omitempty"`
-	Kind        string    `yaml:"kind"`
-	Description string    `yaml:"description,omitempty"`
-	Service     string    `yaml:"service,omitempty"`
-	Script      string    `yaml:"script,omitempty"`
-	Text        string    `yaml:"text,omitempty"`
-	Error       string    `yaml:"error,omitempty"`
+	Timestamp   time.Time   `yaml:"timestamp,omitempty"`
+	Kind        string      `yaml:"kind"`
+	Description string      `yaml:"description,omitempty"`
+	Service     string      `yaml:"service,omitempty"`
+	Script      string      `yaml:"script,omitempty"`
+	Text        string      `yaml:"text,omitempty"`
+	Error       string      `yaml:"error,omitempty"`
+	Usage       *TokenUsage `yaml:"usage,omitempty"`
 }
 
 func createSessionLog() (*os.File, error) {
@@ -52,8 +53,8 @@ func createSessionLog() (*os.File, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	name := "session-" + time.Now().UTC().Format("2006-01-02T15-04-05.000000000Z") + ".yml"
-	return os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	name := "session-" + time.Now().UTC().Format("2006-01-02T15-04-05.000000000Z") + "-*.yml"
+	return os.CreateTemp(dir, name)
 }
 
 func readSessionFile(name string, value any) error {
@@ -90,6 +91,7 @@ func (c *sessionConfig) validate(server *Server) error {
 }
 
 const defaultSystem = `You are an agent working through persistent Starlark REPLs, one per service.
+Scripts use Starlark, not Python; use Starlark syntax and builtins.
 Use exec(description, service, script) to run Starlark. Every call must include a description field containing one sentence explaining what the code does. The empty service name selects the server REPL.
 Inspect results and use the documented APIs to accomplish the user's task. Print values you need to see.
 Keep changes minimal and give a concise final answer.`
@@ -169,6 +171,10 @@ func (r *recordedTurn) OnMessage(kind, text string) error {
 	return r.write(sessionMessage{Kind: kind, Text: text})
 }
 
+func (r *recordedTurn) OnUsage(usage TokenUsage) error {
+	return r.write(sessionMessage{Kind: "usage", Usage: &usage})
+}
+
 func (r *recordedTurn) OnToolCall(ctx context.Context, description, service, script string) (string, error) {
 	if err := r.write(sessionMessage{Kind: "tool_call", Description: description, Service: service, Script: script}); err != nil {
 		return "", err
@@ -194,7 +200,7 @@ func (log *sessionLog) replay(ctx context.Context, server *Server) error {
 				return fmt.Errorf("message %d: tool_call requires a matching tool_result", i+1)
 			}
 			i++
-		case "system", "developer", "user", "commentary", "reasoning", "end_turn", "error":
+		case "system", "developer", "user", "commentary", "reasoning", "end_turn", "error", "usage":
 		default:
 			return fmt.Errorf("message %d: unexpected kind %q", i+1, message.Kind)
 		}
@@ -221,7 +227,7 @@ func (log *sessionLog) replay(ctx context.Context, server *Server) error {
 			gotError = callErr.Error()
 		}
 		want := log.Messages[i+1]
-		if text != want.Text || gotError != want.Error {
+		if normalizeReplayOutput(text) != normalizeReplayOutput(want.Text) || normalizeReplayOutput(gotError) != normalizeReplayOutput(want.Error) {
 			return fmt.Errorf("message %d, service %q: result mismatch\nwant text: %q\n got text: %q\nwant error: %q\n got error: %q", i+1, message.Service, want.Text, text, want.Error, gotError)
 		}
 	}

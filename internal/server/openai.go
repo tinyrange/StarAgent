@@ -64,7 +64,7 @@ func (s *openAISession) RunTurn(ctx context.Context, input TurnInput, callbacks 
 	}
 	s.appendInput(map[string]any{"role": "user", "content": input.Message})
 	for {
-		output, err := s.respond(ctx)
+		output, err := s.respond(ctx, callbacks)
 		if err != nil {
 			return err
 		}
@@ -163,7 +163,7 @@ func (s *openAISession) RunTurn(ctx context.Context, input TurnInput, callbacks 
 	}
 }
 
-func (s *openAISession) respond(ctx context.Context) ([]json.RawMessage, error) {
+func (s *openAISession) respond(ctx context.Context, callbacks TurnCallbacks) ([]json.RawMessage, error) {
 	reasoning := map[string]string{"summary": "auto"}
 	if s.config.ReasoningEffort != "" {
 		reasoning["effort"] = s.config.ReasoningEffort
@@ -195,6 +195,7 @@ func (s *openAISession) respond(ctx context.Context) ([]json.RawMessage, error) 
 		return nil, fmt.Errorf("OpenAI HTTP %d: %s", response.StatusCode, data)
 	}
 	var result struct {
+		Usage             *TokenUsage       `json:"usage"`
 		Status            string            `json:"status"`
 		Output            []json.RawMessage `json:"output"`
 		Error             json.RawMessage   `json:"error"`
@@ -202,6 +203,11 @@ func (s *openAISession) respond(ctx context.Context) ([]json.RawMessage, error) 
 	}
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, err
+	}
+	if result.Usage != nil {
+		if err := callbacks.OnUsage(*result.Usage); err != nil {
+			return nil, err
+		}
 	}
 	if result.Status != "completed" {
 		return nil, fmt.Errorf("OpenAI response status %q: error=%s incomplete_details=%s", result.Status, result.Error, result.IncompleteDetails)

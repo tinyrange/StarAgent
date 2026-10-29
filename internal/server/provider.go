@@ -21,7 +21,23 @@ type TurnInput struct {
 
 type TurnCallbacks interface {
 	OnMessage(kind, text string) error
+	OnUsage(usage TokenUsage) error
 	OnToolCall(ctx context.Context, description, service, line string) (string, error)
+}
+
+// TokenUsage records one model response. Reasoning tokens are part of output_tokens,
+// and cached tokens are part of input_tokens; they must not be added twice.
+type TokenUsage struct {
+	InputTokens        int `json:"input_tokens" yaml:"input_tokens"`
+	OutputTokens       int `json:"output_tokens" yaml:"output_tokens"`
+	TotalTokens        int `json:"total_tokens" yaml:"total_tokens"`
+	InputTokensDetails *struct {
+		CachedTokens     *int `json:"cached_tokens" yaml:"cached_tokens,omitempty"`
+		CacheWriteTokens *int `json:"cache_write_tokens" yaml:"cache_write_tokens,omitempty"`
+	} `json:"input_tokens_details" yaml:"input_tokens_details,omitempty"`
+	OutputTokensDetails *struct {
+		ReasoningTokens *int `json:"reasoning_tokens" yaml:"reasoning_tokens,omitempty"`
+	} `json:"output_tokens_details" yaml:"output_tokens_details,omitempty"`
 }
 
 type ProviderSession interface {

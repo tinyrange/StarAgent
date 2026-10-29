@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"go.starlark.net/starlark"
-	"go.starlark.net/syntax"
 	"gopkg.in/yaml.v3"
 
 	"github.com/tinyrange/staragent/internal/repl"
@@ -28,13 +27,7 @@ type agentsFile struct {
 
 const agentsFileVersion = 1
 
-var starlarkOptions = syntax.FileOptions{
-	Set:             true,
-	While:           true,
-	TopLevelControl: true,
-	GlobalReassign:  true,
-	Recursion:       true,
-}
+var starlarkOptions = repl.FileOptions()
 
 func loadAgentsYaml(root *os.Root, contents []byte) (starlark.StringDict, error) {
 	var agents agentsFile
@@ -51,6 +44,7 @@ func loadAgentsYaml(root *os.Root, contents []byte) (starlark.StringDict, error)
 		doc:     "help(object) -> str: Return documentation without executing the object.",
 	}}
 	ret["json"] = repl.JSON
+	ret["print"] = repl.Print
 	if agents.Workspace.Read || agents.Workspace.Write {
 		ret["workspace"] = &workspace{
 			root: root, read: agents.Workspace.Read, write: agents.Workspace.Write,

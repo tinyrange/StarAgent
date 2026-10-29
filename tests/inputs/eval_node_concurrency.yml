@@ -1,0 +1,65 @@
+# Evaluation focus: async scheduling, ordering, and failure propagation
+# Run only after review; live recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+developer: "Keep changes small and preserve public APIs unless the task asks for a change. Use the available checks and report their results. If a required toolchain is missing, report that rather than installing it."
+services:
+  main:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "check.js"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Check async concurrency, result order, and rejection behavior."
+                return privileged.shell("node", "check.js", timeout=30).run()
+      README.md: |
+        # Bounded async mapping
+        Node.js 18 or newer; no npm install needed. Run `node check.js` or check().
+        mapLimit(items, limit, fn) invokes fn(item, index) once for each item on success.
+      package.json: |
+        {"name":"bounded-map-eval","private":true,"type":"module"}
+      map-limit.js: |
+        export async function mapLimit(items, limit, fn) {
+          return Promise.all(items.map(fn));
+        }
+      check.js: |
+        import assert from "node:assert/strict";
+        import { mapLimit } from "./map-limit.js";
+
+        let active = 0;
+        let peak = 0;
+        const calls = [];
+        const output = await mapLimit([1, 2, 3, 4], 2, async (value, index) => {
+          calls.push(index);
+          peak = Math.max(peak, ++active);
+          await new Promise(resolve => setTimeout(resolve, (5 - value) * 5));
+          active--;
+          return value * 10;
+        });
+        assert.equal(peak, 2, "must use two slots without exceeding the limit");
+        assert.deepEqual(output, [10, 20, 30, 40]);
+        assert.deepEqual(calls.sort(), [0, 1, 2, 3]);
+        assert.deepEqual(await mapLimit([], 2, () => assert.fail("unexpected call")), []);
+        for (const limit of [0, -1, 1.5, NaN, Infinity]) {
+          await assert.rejects(() => mapLimit([], limit, x => x), RangeError);
+        }
+        const failure = new Error("downstream unavailable");
+        await assert.rejects(() => mapLimit([1], 1, async () => { throw failure; }),
+                             error => error === failure);
+        console.log("bounded map checks passed");
+prompt: |
+  mapLimit currently overloads a downstream API. Fix it so no more than limit callbacks
+  are active at once while keeping results in the same order as the input. It should
+  use the available concurrency, resolve an empty input to [], and reject invalid
+  limits with RangeError unless they are positive integers. A rejected callback must reject the
+  returned promise with the original error. Preserve the public API and use no packages.

@@ -1,7 +1,9 @@
 package repl
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -49,6 +51,16 @@ func TestREPLSession(t *testing.T) {
 		{"x.append(2)", ""},
 		{"x", "[1, 2]\n"},
 		{"print('hello')", "hello\n"},
+		{`print()`, "\n"},
+		{`print(end="")`, ""},
+		{`print("hello", end="")`, "hello"},
+		{`print("a", 42, ["b"], b"c", sep="|", end="!")`, "a|42|[\"b\"]|c!"},
+		{`print("a", end=""); print("b")`, "ab\n"},
+		{`print("a\n", end="")`, "a\n"},
+		{`saved_print = print`, ""},
+		{"def emit():\n    saved_print('saved', end='!')", ""},
+		{`emit()`, "saved!"},
+		{`print("untouched default")`, "untouched default\n"},
 		{")", "<repl>:1:1: unexpected ')'\n"},
 		{"1 / 0", "error: floating-point division by zero\n"},
 		{"x.append(3); print(x)", "[1, 2, 3]\n"},
@@ -88,3 +100,21 @@ func TestREPLTruncatedRequest(t *testing.T) {
 		t.Fatal("accepted a truncated request")
 	}
 }
+
+func TestPrintErrors(t *testing.T) {
+	opts := Options{SyntaxOptions: &syntax.FileOptions{}, Thread: &starlark.Thread{}, Environment: make(starlark.StringDict)}
+	for _, script := range []string{`print("x", end=1)`, `print("x", sep=None)`, `print("x", unknown="")`} {
+		var output bytes.Buffer
+		if err := Evaluate(opts, script, &output); err != nil || !strings.HasPrefix(output.String(), "error: print:") {
+			t.Fatalf("%s: output=%q, error=%v", script, output.String(), err)
+		}
+	}
+	want := errors.New("output unavailable")
+	if err := Evaluate(opts, `print("x", end="")`, failedWriter{want}); !errors.Is(err, want) {
+		t.Fatalf("output failure: got %v, want %v", err, want)
+	}
+}
+
+type failedWriter struct{ err error }
+
+func (w failedWriter) Write([]byte) (int, error) { return 0, w.err }

@@ -30,7 +30,7 @@ func (*workspace) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable: wor
 var workspaceMethodDocs = map[string]string{
 	"read_file":   "workspace.read_file(path, start_line=1, end_line=None) -> {ok, path, text, start_line, end_line, truncated}: Inclusive 1-based lines; omitted end_line reads up to 200 lines. end_line is the last returned line (start_line-1 if empty); truncated means more lines follow. Original line endings are preserved.",
 	"exists":      "workspace.exists(path) -> {ok, path, exists}: exists=False if missing; other errors raise.",
-	"list_dir":    "workspace.list_dir(path) -> {ok, paths}: Sorted workspace-relative paths of immediate entries, including denied files.",
+	"list_dir":    "workspace.list_dir(path=\".\") -> {ok, paths}: Sorted workspace-relative paths of immediate entries, including denied files. Defaults to the workspace root.",
 	"glob":        "workspace.glob(pattern) -> {ok, paths}: Sorted workspace-relative matches; ** recurses. Includes denied files; does not follow directory symlinks.",
 	"search":      "workspace.search(pattern, query, limit=100) -> {ok, matches, truncated}: Go regex over glob-matched files, including denied files. matches contains {path, line, text} per matching line, sorted by path and 1-based line number. text excludes line endings; truncated means more matches exist. limit must be positive.",
 	"mkdir":       "workspace.mkdir(path) -> {ok, path}: Create directory and parents; existing directories are OK.",
@@ -41,7 +41,7 @@ var workspaceMethodDocs = map[string]string{
 
 func (w *workspace) Doc() string {
 	var doc strings.Builder
-	fmt.Fprintf(&doc, "workspace(root=%q, read=%t, write=%t, denied_files=%q)\n", w.root.Name(), w.read, w.write, w.deniedFiles)
+	fmt.Fprintf(&doc, "workspace: existing workspace object\nConfig: root=%q, read=%t, write=%t\n", w.root.Name(), w.read, w.write)
 	doc.WriteString("Paths are relative to root. All operations return result objects with ok=True; failures raise. Outside paths raise errors. Denied files block writes, not reads.\n")
 	for _, name := range w.AttrNames() {
 		doc.WriteString(workspaceMethodDocs[name])
@@ -226,8 +226,8 @@ func (w *workspace) exists(_ *starlark.Thread, fn *starlark.Builtin, args starla
 }
 
 func (w *workspace) listDir(_ *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var dir string
-	if err := starlark.UnpackArgs(fn.Name(), args, kwargs, "path", &dir); err != nil {
+	dir := "."
+	if err := starlark.UnpackArgs(fn.Name(), args, kwargs, "path?", &dir); err != nil {
 		return nil, err
 	}
 	entries, err := fs.ReadDir(w.root.FS(), dir)

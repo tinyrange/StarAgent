@@ -1,0 +1,142 @@
+# Evaluation focus: Objective-C collection semantics and LRU eviction
+# Run only after review; live recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+developer: "Keep changes small and preserve public APIs unless the task asks for a change. Use the available checks and report their results. If a required toolchain is missing, report that rather than installing it."
+services:
+  main:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "check.m"]
+        environment:
+          check: |
+            def check():
+                """check() -> result: Compile Objective-C with ARC and Foundation, then run LRU checks."""
+                compiled = privileged.shell("clang", "-fobjc-arc", "-Wall", "-Wextra", "-Werror", "-framework", "Foundation", "LRUCache.m", "check.m", "-o", ".lru-check", timeout=60).run()
+                if not compiled.ok:
+                    return compiled
+                return privileged.shell("./.lru-check", timeout=10).run()
+      README.md: |
+        # Foundation LRU cache
+        Uses clang and Foundation from Xcode on macOS, with ARC enabled.
+        check() compiles LRUCache.m and check.m, then runs the result.
+        The public interface is in LRUCache.h. No external libraries are required.
+      LRUCache.h: |
+        #import <Foundation/Foundation.h>
+
+        NS_ASSUME_NONNULL_BEGIN
+        @interface LRUCache : NSObject
+        - (instancetype)initWithCapacity:(NSUInteger)capacity;
+        - (void)setObject:(NSString *)value forKey:(NSString *)key;
+        - (nullable NSString *)objectForKey:(NSString *)key;
+        - (NSUInteger)count;
+        @end
+        NS_ASSUME_NONNULL_END
+      LRUCache.m: |
+        #import "LRUCache.h"
+
+        @implementation LRUCache {
+            NSUInteger _capacity;
+            NSMutableDictionary<NSString *, NSString *> *_values;
+            NSMutableArray<NSString *> *_order;
+        }
+
+        - (instancetype)initWithCapacity:(NSUInteger)capacity {
+            if (capacity == 0) {
+                @throw [NSException exceptionWithName:NSInvalidArgumentException
+                                              reason:@"capacity must be positive" userInfo:nil];
+            }
+            self = [super init];
+            if (self) {
+                _capacity = capacity;
+                _values = [NSMutableDictionary dictionary];
+                _order = [NSMutableArray array];
+            }
+            return self;
+        }
+
+        - (void)setObject:(NSString *)value forKey:(NSString *)key {
+            if (_values[key] == nil) {
+                [_order addObject:key];
+            }
+            _values[key] = value;
+            if (_values.count > _capacity) {
+                NSString *oldest = _order.firstObject;
+                [_values removeObjectForKey:oldest];
+                [_order removeObjectAtIndex:0];
+            }
+        }
+
+        - (NSString *)objectForKey:(NSString *)key {
+            return _values[key];
+        }
+
+        - (NSUInteger)count { return _values.count; }
+        @end
+      check.m: |
+        #import "LRUCache.h"
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        static void expect(BOOL condition, const char *message) {
+            if (!condition) {
+                fprintf(stderr, "%s\n", message);
+                exit(1);
+            }
+        }
+
+        int main(void) {
+            @autoreleasepool {
+                LRUCache *reads = [[LRUCache alloc] initWithCapacity:2];
+                [reads setObject:@"A" forKey:@"a"];
+                [reads setObject:@"B" forKey:@"b"];
+                expect([[reads objectForKey:@"a"] isEqualToString:@"A"], "read lost value");
+                [reads setObject:@"C" forKey:@"c"];
+                expect([reads objectForKey:@"b"] == nil, "read did not refresh recency");
+                expect(reads.count == 2, "cache exceeded capacity");
+
+                LRUCache *writes = [[LRUCache alloc] initWithCapacity:2];
+                [writes setObject:@"old" forKey:@"a"];
+                [writes setObject:@"B" forKey:@"b"];
+                [writes setObject:@"new" forKey:@"a"];
+                expect(writes.count == 2, "replacement increased count");
+                expect([writes objectForKey:@"missing"] == nil, "missing read returned a value");
+                [writes setObject:@"C" forKey:@"c"];
+                expect([writes objectForKey:@"b"] == nil, "write did not refresh recency");
+                expect([[writes objectForKey:@"a"] isEqualToString:@"new"], "replacement was lost");
+                [writes setObject:@"D" forKey:@"d"];
+                expect([writes objectForKey:@"c"] == nil, "recency broke after another eviction");
+                expect(writes.count == 2, "count grew after repeated eviction");
+
+                LRUCache *one = [[LRUCache alloc] initWithCapacity:1];
+                [one setObject:@"A" forKey:@"a"];
+                [one setObject:@"B" forKey:@"b"];
+                expect([one objectForKey:@"a"] == nil && one.count == 1, "capacity-one cache is wrong");
+                BOOL rejected = NO;
+                @try {
+                    (void)[[LRUCache alloc] initWithCapacity:0];
+                } @catch (NSException *error) {
+                    rejected = [error.name isEqualToString:NSInvalidArgumentException];
+                }
+                expect(rejected, "zero capacity was not rejected correctly");
+                puts("Objective-C LRU checks passed");
+            }
+            return 0;
+        }
+prompt: |
+  This Foundation cache evicts recently read entries and treats replacement writes as
+  though they had never been accessed. Fix it to implement least-recently-used eviction:
+  successful reads and all writes refresh recency, replacing a value does not increase
+  count, and missing reads return nil without changing order or evicting anything.
+  Keep the configured capacity bound and existing public API. Capacity zero must still
+  raise NSInvalidArgumentException. Keys and values are non-null strings. Use Foundation
+  only; thread safety is out of scope.

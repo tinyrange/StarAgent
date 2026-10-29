@@ -1,0 +1,91 @@
+# Evaluation focus: boundary conditions, ownership, and Go tests
+# Run only after review; live recordings are retained in tests/sessions.
+version: 1
+provider:
+  name: "openai"
+  model: "gpt-6.1-sol"
+  reasoning: "high"
+developer: "Keep changes small and preserve public APIs unless the task asks for a change. Use the available checks and report their results. If a required toolchain is missing, report that rather than installing it."
+services:
+  main:
+    kind: "service"
+    temp_workspace: true
+    files:
+      AGENTS.yml: |
+        version: 1
+        workspace:
+          read: true
+          write: true
+          denied_files: ["AGENTS.yml", "page_test.go"]
+        environment:
+          check: |
+            def check():
+                "check() -> result: Run the Go pagination tests without downloading a toolchain."
+                return privileged.shell("go", "test", "-count=1", "./...", timeout=60, env={"GOTOOLCHAIN": "local", "GOWORK": "off", "GOPROXY": "off"}).run()
+      README.md: |
+        # Pagination
+        Go 1.22 or newer; no external modules. Page returns a page of integer IDs.
+        Use `go test -count=1 ./...` or check().
+      go.mod: |
+        module example.test/pagination
+
+        go 1.22
+      page.go: |
+        package pagination
+
+        func Page(items []int, page, size int) ([]int, error) {
+        	start := (page - 1) * size
+        	end := start + size
+        	if end > len(items) {
+        		end = len(items)
+        	}
+        	return items[start:end], nil
+        }
+      page_test.go: |
+        package pagination
+
+        import (
+        	"slices"
+        	"testing"
+        )
+
+        func TestPage(t *testing.T) {
+        	for _, tc := range []struct {
+        		name string
+        		page, size int
+        		want []int
+        		bad bool
+        	}{
+        		{"first", 0, 2, []int{10, 20}, false},
+        		{"tail", 1, 2, []int{30}, false},
+        		{"past end", 2, 2, nil, false},
+        		{"huge page", int(^uint(0) >> 1), 2, nil, false},
+        		{"huge size", 0, int(^uint(0) >> 1), []int{10, 20, 30}, false},
+        		{"negative page", -1, 2, nil, true},
+        		{"zero size", 0, 0, nil, true},
+        		{"negative size", 0, -1, nil, true},
+        	} {
+        		t.Run(tc.name, func(t *testing.T) {
+        			got, err := Page([]int{10, 20, 30}, tc.page, tc.size)
+        			if (err != nil) != tc.bad || (!tc.bad && !slices.Equal(got, tc.want)) {
+        				t.Fatalf("got %v, %v; want %v, error=%v", got, err, tc.want, tc.bad)
+        			}
+        		})
+        	}
+        }
+
+        func TestEmptyAndOwnership(t *testing.T) {
+        	got, err := Page(nil, 0, 3)
+        	if err != nil || len(got) != 0 { t.Fatalf("empty input: %v, %v", got, err) }
+        	items := []int{1, 2, 3}
+        	got, err = Page(items, 0, 2)
+        	if err != nil { t.Fatal(err) }
+        	got[0] = 99
+        	if items[0] != 1 { t.Fatal("result aliases the input") }
+        }
+prompt: |
+  Fix the Page helper in the pagination service. Pages are zero-based. Negative page
+  numbers and nonpositive page sizes must return an error. Pages beyond the end return
+  an empty slice without an error, including very large page numbers. Results must not
+  share writable backing storage with the input. Preserve the Page signature and avoid
+  unrelated changes.
