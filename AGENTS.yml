@@ -13,4 +13,7 @@ environment:
       return "Hello, " + world
   whoami: |
     def whoami():
+      """
+      Return the current user.
+      """
       return privileged.shell("whoami").output()

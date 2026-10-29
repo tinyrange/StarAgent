@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"strings"
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
@@ -43,7 +44,10 @@ func loadAgentsYaml(root *os.Root, contents []byte) (starlark.StringDict, error)
 		return nil, fmt.Errorf("unexpected version: expected %d got %d", agentsFileVersion, agents.Version)
 	}
 
-	ret := make(starlark.StringDict)
+	ret := starlark.StringDict{"help": &documentedBuiltin{
+		Builtin: starlark.NewBuiltin("help", help),
+		doc:     "help(object) -> str: Return documentation without executing the object.",
+	}}
 	if agents.Workspace.Read || agents.Workspace.Write {
 		ret["workspace"] = &workspace{
 			root: root, read: agents.Workspace.Read, write: agents.Workspace.Write,
@@ -72,6 +76,24 @@ func loadAgentsYaml(root *os.Root, contents []byte) (starlark.StringDict, error)
 	return ret, nil
 }
 
+func help(_ *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var object starlark.Value
+	if err := starlark.UnpackArgs(fn.Name(), args, kwargs, "object", &object); err != nil {
+		return nil, err
+	}
+	if documented, ok := object.(interface{ Doc() string }); ok {
+		return starlark.String(strings.TrimSpace(documented.Doc())), nil
+	}
+	return nil, fmt.Errorf("help: no documentation for %s", object.Type())
+}
+
+type documentedBuiltin struct {
+	*starlark.Builtin
+	doc string
+}
+
+func (b *documentedBuiltin) Doc() string { return b.doc }
+
 func Run() error {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
@@ -97,10 +119,21 @@ func Run() error {
 		return fmt.Errorf("failed to load AGENTS.yml: %w", err)
 	}
 
+	var documentation []string
+	for _, name := range env.Keys() {
+		doc := env[name].Type()
+		if documented, ok := env[name].(interface{ Doc() string }); ok {
+			if text := strings.TrimSpace(documented.Doc()); text != "" {
+				doc = text
+			}
+		}
+		documentation = append(documentation, name+":\n"+doc)
+	}
+
 	return repl.Start(repl.Options{
 		SyntaxOptions: &starlarkOptions,
 		Thread:        &starlark.Thread{Name: "service repl"},
 		Environment:   env,
-		Documentation: "",
+		Documentation: strings.Join(documentation, "\n\n"),
 	})
 }

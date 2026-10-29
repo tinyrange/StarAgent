@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"go.starlark.net/starlark"
 )
@@ -21,6 +22,25 @@ func (*workspace) Freeze()               {}
 func (*workspace) Truth() starlark.Bool  { return starlark.True }
 func (*workspace) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable: workspace") }
 
+var workspaceMethodDocs = map[string]string{
+	"read_file":   "workspace.read_file(path: str) -> str: Read file contents.",
+	"exists":      "workspace.exists(path: str) -> bool: False if missing; other errors raise.",
+	"mkdir":       "workspace.mkdir(path: str) -> None: Create directory and parents; existing directories are OK.",
+	"write_file":  "workspace.write_file(path: str, contents: str) -> None: Create or overwrite a file; parent must exist.",
+	"delete_file": "workspace.delete_file(path: str) -> None: Remove a file or empty directory; missing paths raise.",
+}
+
+func (w *workspace) Doc() string {
+	var doc strings.Builder
+	doc.WriteString(fmt.Sprintf("workspace(root=%q, read=%t, write=%t, denied_files=%q)\n", w.root.Name(), w.read, w.write, w.deniedFiles))
+	doc.WriteString("Paths are relative to root. Outside paths and denied files raise errors.\n")
+	for _, name := range w.AttrNames() {
+		doc.WriteString(workspaceMethodDocs[name])
+		doc.WriteString("\n")
+	}
+	return doc.String()
+}
+
 func (w *workspace) AttrNames() []string {
 	var names []string
 	if w.read {
@@ -33,25 +53,29 @@ func (w *workspace) AttrNames() []string {
 }
 
 func (w *workspace) Attr(name string) (starlark.Value, error) {
+	var builtin *starlark.Builtin
 	if w.read {
 		switch name {
 		case "read_file":
-			return starlark.NewBuiltin("workspace.read_file", w.readFile), nil
+			builtin = starlark.NewBuiltin("workspace.read_file", w.readFile)
 		case "exists":
-			return starlark.NewBuiltin("workspace.exists", w.exists), nil
+			builtin = starlark.NewBuiltin("workspace.exists", w.exists)
 		}
 	}
 	if w.write {
 		switch name {
 		case "mkdir":
-			return starlark.NewBuiltin("workspace.mkdir", w.mkdir), nil
+			builtin = starlark.NewBuiltin("workspace.mkdir", w.mkdir)
 		case "write_file":
-			return starlark.NewBuiltin("workspace.write_file", w.writeFile), nil
+			builtin = starlark.NewBuiltin("workspace.write_file", w.writeFile)
 		case "delete_file":
-			return starlark.NewBuiltin("workspace.delete_file", w.deleteFile), nil
+			builtin = starlark.NewBuiltin("workspace.delete_file", w.deleteFile)
 		}
 	}
-	return nil, nil
+	if builtin == nil {
+		return nil, nil
+	}
+	return &documentedBuiltin{Builtin: builtin, doc: workspaceMethodDocs[name]}, nil
 }
 
 func (w *workspace) checkPath(path string) error {

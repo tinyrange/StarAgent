@@ -22,6 +22,15 @@ provider:
     - service: main
       script: |
         print(whoami())
+    - service: main
+      script: |
+        print(help(whoami))
+    - service: main
+      script: |
+        print(help(workspace))
+    - service: main
+      script: |
+        print(help(workspace.read_file))
 services:
   main:
     kind: shell-repl
