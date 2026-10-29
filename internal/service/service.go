@@ -47,9 +47,10 @@ func loadAgentsYaml(root *os.Root, contents []byte) (starlark.StringDict, error)
 	}
 
 	ret := starlark.StringDict{"help": &documentedBuiltin{
-		Builtin: starlark.NewBuiltin("help", help),
+		Builtin: starlark.NewBuiltin("help", repl.Help),
 		doc:     "help(object) -> str: Return documentation without executing the object.",
 	}}
+	ret["json"] = repl.JSON
 	if agents.Workspace.Read || agents.Workspace.Write {
 		ret["workspace"] = &workspace{
 			root: root, read: agents.Workspace.Read, write: agents.Workspace.Write,
@@ -84,17 +85,6 @@ func loadAgentsYaml(root *os.Root, contents []byte) (starlark.StringDict, error)
 	}
 
 	return ret, nil
-}
-
-func help(_ *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var object starlark.Value
-	if err := starlark.UnpackArgs(fn.Name(), args, kwargs, "object", &object); err != nil {
-		return nil, err
-	}
-	if documented, ok := object.(interface{ Doc() string }); ok {
-		return starlark.String(strings.TrimSpace(documented.Doc())), nil
-	}
-	return nil, fmt.Errorf("help: no documentation for %s", object.Type())
 }
 
 type documentedBuiltin struct {

@@ -144,3 +144,13 @@ func TestHelloFile(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+func TestServiceFile(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "run", "./cmd/sa-server", "-run-test", "tests/service_tests.yml")
+	cmd.Dir = "../.."
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("service_tests.yml: %v\n%s", err, output)
+	}
+}

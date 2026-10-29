@@ -1,0 +1,208 @@
+version: 1
+provider:
+  name: test
+  scripts:
+    - service: main
+      script: |
+        def check(condition, message):
+          if not condition:
+            fail(message)
+
+    # Workspace
+    - service: main
+      script: print(workspace.read_file("go.mod").text)
+    - service: main
+      script: |
+        workspace.mkdir("local")
+        workspace.write_file("local/hello.txt", "Hello, World")
+        print(workspace.read_file("local/hello.txt").text)
+        workspace.delete_file("local/hello.txt")
+        print(workspace.exists("local/hello.txt").exists)
+    - service: main
+      script: |
+        print(workspace.list_dir("."))
+        print(workspace.glob("**/*.go"))
+    - service: main
+      script: |
+        print(workspace.search("**/*.go", "func"))
+
+    # Exact edits and consistent result objects
+    - service: main
+      script: |
+        check(not workspace.exists("local/service-tests").exists, "test directory already exists")
+        check(workspace.mkdir("local/service-tests").ok, "mkdir failed")
+        edit_path = "local/service-tests/edit.txt"
+        check(workspace.write_file(edit_path, "first\nmatch one\nmiddle\nmatch two\nlast").ok, "write failed")
+        edited = workspace.edit_file(edit_path, "middle", "changed")
+        check(edited.ok and edited.path == edit_path, "edit result")
+        expected = "first\nmatch one\nchanged\nmatch two\nlast"
+        full = workspace.read_file(edit_path)
+        check(full.ok and full.text == expected, "edit contents")
+        check(full.start_line == 1 and full.end_line == 5 and not full.truncated, "full read metadata")
+        check(workspace.list_dir("local/service-tests").paths == [edit_path], "list result")
+        check(workspace.glob("local/service-tests/*.txt").paths == [edit_path], "glob result")
+        check(workspace.exists(edit_path).ok and workspace.exists(edit_path).exists, "exists result")
+    - service: main
+      should_fail: true
+      script: workspace.edit_file(edit_path, "missing", "replacement")
+    - service: main
+      should_fail: true
+      script: workspace.edit_file(edit_path, "match", "replacement")
+    - service: main
+      should_fail: true
+      script: workspace.edit_file(edit_path, "", "replacement")
+    - service: main
+      script: |
+        check(workspace.read_file(edit_path).text == expected, "failed edits changed file")
+        workspace.write_file("local/service-tests/overlap.txt", "aaa")
+    - service: main
+      should_fail: true
+      script: workspace.edit_file("local/service-tests/overlap.txt", "aa", "b")
+    - service: main
+      script: |
+        check(workspace.read_file("local/service-tests/overlap.txt").text == "aaa", "ambiguous edit changed file")
+        workspace.edit_file(edit_path, "changed\nmatch two", "replaced\nmatch two")
+        expected = "first\nmatch one\nreplaced\nmatch two\nlast"
+        check(workspace.read_file(edit_path).text == expected, "multiline edit")
+
+    # Bounded reads: inclusive ranges, exact boundaries, empty files, and paging
+    - service: main
+      script: |
+        part = workspace.read_file(edit_path, start_line=2, end_line=4)
+        check(part.text == "match one\nreplaced\nmatch two\n", "range text")
+        check(part.start_line == 2 and part.end_line == 4 and part.truncated, "range metadata")
+        tail = workspace.read_file(edit_path, start_line=5, end_line=10)
+        check(tail.text == "last" and tail.end_line == 5 and not tail.truncated, "last unterminated line")
+        beyond = workspace.read_file(edit_path, start_line=9, end_line=10)
+        check(beyond.text == "" and beyond.end_line == 8 and not beyond.truncated, "read past EOF")
+        workspace.write_file("local/service-tests/empty.txt", "")
+        empty = workspace.read_file("local/service-tests/empty.txt")
+        check(empty.text == "" and empty.start_line == 1 and empty.end_line == 0 and not empty.truncated, "empty read")
+        workspace.write_file("local/service-tests/many.txt", "hit\n" * 205)
+        first = workspace.read_file("local/service-tests/many.txt")
+        check(first.text == "hit\n" * 200 and first.end_line == 200 and first.truncated, "default read cap")
+        rest = workspace.read_file("local/service-tests/many.txt", start_line=201)
+        check(rest.text == "hit\n" * 5 and rest.end_line == 205 and not rest.truncated, "read next page")
+    - service: main
+      should_fail: true
+      script: workspace.read_file(edit_path, start_line=0)
+    - service: main
+      should_fail: true
+      script: workspace.read_file(edit_path, start_line=4, end_line=2)
+
+    # Bounded regex search: truncation only when another match exists
+    - service: main
+      script: |
+        one = workspace.search(edit_path, "^match", limit=1)
+        check(one.ok and one.truncated and len(one.matches) == 1, "search cap")
+        check(one.matches[0].path == edit_path and one.matches[0].line == 2 and one.matches[0].text == "match one", "search match")
+        exact = workspace.search(edit_path, "^match", limit=2)
+        check(len(exact.matches) == 2 and not exact.truncated, "exact search cap")
+        none = workspace.search(edit_path, "absent", limit=1)
+        check(none.matches == [] and not none.truncated, "empty search")
+        default = workspace.search("local/service-tests/many.txt", "hit")
+        check(len(default.matches) == 100 and default.truncated, "default search cap")
+        all_matches = workspace.search("local/service-tests/many.txt", "hit", limit=205)
+        check(len(all_matches.matches) == 205 and not all_matches.truncated, "explicit search cap")
+    - service: main
+      should_fail: true
+      script: workspace.search(edit_path, "match", limit=0)
+
+    # Safety
+    - service: main
+      should_fail: true
+      script: |
+        workspace.write_file("AGENTS.yml", "hello")
+    - service: main
+      should_fail: true
+      script: |
+        workspace.edit_file("AGENTS.yml", "version: 1", "version: 2")
+    - service: main
+      should_fail: true
+      script: |
+        workspace.edit_file("../AGENTS.yml", "version: 1", "version: 2")
+    - service: main
+      script: |
+        check(workspace.read_file("AGENTS.yml").text.startswith("version: 1"), "denied file changed")
+        check(workspace.search("AGENTS.yml", "^version:").matches[0].line == 1, "denied file should be readable")
+
+    # Clean up only files created by these tests
+    - service: main
+      script: |
+        for file in workspace.list_dir("local/service-tests").paths:
+          check(workspace.delete_file(file).ok, "delete result")
+        check(workspace.delete_file("local/service-tests").ok, "remove test directory")
+        missing = workspace.exists(edit_path)
+        check(missing.ok and not missing.exists, "missing path result")
+
+    # Shell Commands
+    - service: main
+      should_fail: true
+      script: |
+        print(privileged.shell("whoami").output())
+    - service: main
+      script: |
+        print(whoami())
+
+    # Command timeout kwargs apply to both run() and output()
+    - service: timeouts
+      script: |
+        if not wait(0, timeout=1).ok:
+          fail("command failed before timeout")
+        if wait(0, timeout=None, output=True) != "":
+          fail("output without timeout")
+    - service: timeouts
+      should_fail: true
+      script: wait(1, timeout=0.02)
+    - service: timeouts
+      should_fail: true
+      script: wait(1, timeout=0.02, output=True)
+    - service: timeouts
+      should_fail: true
+      script: wait(0, timeout=0)
+    - service: timeouts
+      should_fail: true
+      script: wait(0, timeout="1")
+    - service: timeouts
+      script: |
+        if not wait(0, timeout=1).ok:
+          fail("service unusable after timeout")
+
+    # Docs
+    - service: main
+      script: |
+        print(help(whoami))
+    - service: main
+      script: |
+        print(help(workspace))
+    - service: main
+      script: |
+        print(help(workspace.read_file))
+
+    # Stdlib
+    - service: main
+      script: |
+        print(go.format_check("./..."))
+        print(go.build_check("./cmd/sa-service"))
+
+    # JSON
+    - service: main
+      script: |
+        print(json.encode({"hello": True}))
+
+    # Builtin
+    - script: |
+        print(service.list())
+        print(service.get("main").exec("print(2+2)"))
+    - script: |
+        print(help(service))
+        print(service.get("main").help())
+    - script: |
+        print(json.encode({"hello": True}))
+services:
+  main:
+    kind: shell-repl
+    args: ["go", "run", "./cmd/sa-service", "-cwd", "."]
+  timeouts:
+    kind: shell-repl
+    args: ["go", "run", "./cmd/sa-service", "-cwd", "tests/fixtures/timeouts"]

@@ -1,0 +1,9 @@
+version: 1
+environment:
+  wait: |
+    def wait(seconds, timeout=None, output=False):
+      """Run sleep to exercise command timeouts without granting arbitrary execution."""
+      command = privileged.shell("sleep", str(seconds), timeout=timeout)
+      if output:
+        return command.output()
+      return command.run()

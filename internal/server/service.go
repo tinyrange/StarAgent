@@ -6,7 +6,9 @@ import (
 	"io"
 	"strings"
 
+	"github.com/tinyrange/staragent/internal/repl"
 	"go.starlark.net/starlark"
+	"go.starlark.net/starlarkstruct"
 	"go.starlark.net/syntax"
 )
 
@@ -34,7 +36,7 @@ func (s *serverService) Close() error {
 
 // Documentation implements [Service].
 func (s *serverService) Documentation(ctx context.Context) (string, error) {
-	return "", nil
+	return serviceDoc, nil
 }
 
 // ExecuteLine implements [Service].
@@ -47,6 +49,7 @@ func (s *serverService) ExecuteLine(ctx context.Context, line string) (string, e
 	}
 
 	thread := s.getThread()
+	thread.SetLocal("context", ctx)
 	var output strings.Builder
 	thread.Print = func(_ *starlark.Thread, msg string) {
 		fmt.Fprintln(&output, msg)
@@ -70,7 +73,17 @@ func (s *serverService) getThread() *starlark.Thread {
 }
 
 func (s *serverService) Init(ctx context.Context) error {
-	s.declared = make(starlark.StringDict)
+	s.declared = starlark.StringDict{
+		"help": starlark.NewBuiltin("help", repl.Help),
+		"json": repl.JSON,
+		"service": &documentedModule{
+			Module: &starlarkstruct.Module{Name: "service", Members: starlark.StringDict{
+				"list": starlark.NewBuiltin("service.list", s.listServices),
+				"get":  starlark.NewBuiltin("service.get", s.getService),
+			}},
+			doc: serviceDoc,
+		},
+	}
 
 	return nil
 }
